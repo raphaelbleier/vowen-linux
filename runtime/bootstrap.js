@@ -112,6 +112,52 @@ app.whenReady().then(() => {
   app.on('will-quit', () => mon.kill());
 });
 
+// screen.getCursorScreenPoint() under XWayland only tracks the pointer while it is over an X window. On KDE, stream the
+// real position from KWin (vowen-activewin --cursor-watch) and serve it instead; fall back to Electron's value when the
+// helper is missing, not on KDE, or has exited.
+// Units: the helper sends KWin global logical px plus the output's devicePixelRatio. XWayland coordinates are
+// logical*ratio (uniform scale assumed), and Electron on X11 divides those by the primary display's scaleFactor to get DIP.
+// With scale 1 everywhere (the verified setup) the value passes through unchanged.
+app.whenReady().then(() => {
+  const bin = process.env.VOWEN_ACTIVEWIN_BIN || path.join(process.resourcesPath, 'bin', 'vowen-activewin');
+  if (!fs.existsSync(bin)) return;
+  const original = screen.getCursorScreenPoint.bind(screen);
+  let point = null;
+  const child = spawn('setpriv', ['--pdeathsig', 'TERM', '--', bin, '--cursor-watch', '--parent-stdin'], { stdio: ['pipe', 'pipe', 'ignore'] });
+  child.on('error', () => { point = null; });
+  child.on('exit', () => { point = null; });
+  child.stdin.on('error', () => {});
+  let buf = '';
+  child.stdout.on('data', chunk => {
+    buf += chunk;
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      try {
+        const c = JSON.parse(line).cursor;
+        if (c) point = { x: c.x * (c.scale || 1), y: c.y * (c.scale || 1) };
+      } catch {}
+    }
+  });
+  screen.getCursorScreenPoint = () => {
+    if (!point) return original();
+    const f = screen.getPrimaryDisplay().scaleFactor || 1;
+    return { x: Math.round(point.x / f), y: Math.round(point.y / f) };
+  };
+  app.on('will-quit', () => { try { child.kill(); } catch {} });
+});
+
+// Vowen's will-quit handlers start async sqlite writes. Electron tears down Node right after will-quit,
+// so their callbacks land in a dead environment and node-addon-api aborts the process (core dump, lost
+// writes). Give the event loop a moment to finish them, then exit.
+let drained = false;
+app.on('will-quit', e => {
+  if (drained) return;
+  drained = true;
+  e.preventDefault();
+  setTimeout(() => app.exit(0), 800);
+});
+
 // Logout/shutdown sends SIGTERM; Vowen's windows veto plain closes, so go through its quit path.
 for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
   process.on(sig, () => {

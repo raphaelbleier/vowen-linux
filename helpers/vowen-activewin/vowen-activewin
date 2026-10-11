@@ -2,6 +2,7 @@
 """vowen-activewin: active-window detection + installed-app/browser listing for Linux (stdlib only).
 
   vowen-activewin --watch [--parent-stdin]   NDJSON on stdout for every focus change; serves the socket below
+  vowen-activewin --cursor-watch [--parent-stdin]   NDJSON {"cursor":{x,y,scale}} on pointer motion (KWin only)
   vowen-activewin --get                      one JSON record (asks a running --watch daemon, else queries directly)
   vowen-activewin --cursor                   {"x":..,"y":..} global cursor position (KWin logical px; X11 fallback)
   vowen-activewin --list-apps | --list-browsers | --list-profiles KEY | --icon DESKTOP_ID    JSON for the settings UI
@@ -281,6 +282,16 @@ callDBus("%(n)s", "%(p)s", "%(n)s", "Cursor", JSON.stringify({x: c.x, y: c.y}));
 """
 
 
+SCRIPT_CURSOR = """
+function rep() {
+  var c = workspace.cursorPos, o = workspace.screenAt ? workspace.screenAt(c) : null;
+  callDBus("%(n)s", "%(p)s", "%(n)s", "Cursor", JSON.stringify({x: c.x, y: c.y, scale: o ? o.devicePixelRatio : 1}));
+}
+workspace.cursorPosChanged.connect(rep);
+rep();
+"""
+
+
 class KWin:
     """Owns a bus name; KWin scripts call back into it."""
 
@@ -529,6 +540,55 @@ def watch(parent_stdin):
             pass
 
 
+def cursor_watch(parent_stdin):
+    """NDJSON {"cursor":{x,y,scale}} on stdout; coalesced to <= ~33 updates/s with a trailing update so the final
+    position is never stale. x/y are KWin global logical px, scale = devicePixelRatio of the output under the cursor."""
+    try:
+        kw = KWin()
+        kw.load(SCRIPT_CURSOR, "cw")
+    except (OSError, TimeoutError) as e:
+        print("vowen-activewin: cursor watch needs KWin (%s)" % e, file=sys.stderr)
+        return 4
+    sel = selectors.DefaultSelector()
+    sel.register(kw.bus.s, selectors.EVENT_READ, "bus")
+    if parent_stdin:
+        sel.register(0, selectors.EVENT_READ, "stdin")
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    kw.bus.s.setblocking(False)
+    latest, sent, last_sent = None, None, 0.0
+    try:
+        while True:
+            timeout = None if latest is None or latest == sent else max(0.0, 0.03 - (time.monotonic() - last_sent))
+            for k, _ in sel.select(timeout):
+                if k.data == "stdin":
+                    if not os.read(0, 4096):
+                        return 0
+                    continue
+                try:
+                    d = kw.bus.s.recv(65536)
+                except BlockingIOError:
+                    d = None
+                if d == b"":
+                    return 5
+                kw.bus.buf += d or b""
+                while True:
+                    m = kw.bus.pending.pop(0) if kw.bus.pending else kw.bus._parse()
+                    if not m:
+                        break
+                    if m["type"] == 1 and m["f"].get(3) == "Cursor":
+                        kw.bus.serve_reply(m)
+                        try:
+                            latest = json.loads(m["args"][0])
+                        except (IndexError, ValueError):
+                            pass
+            if latest is not None and latest != sent and time.monotonic() - last_sent >= 0.03:
+                sys.stdout.write(json.dumps({"cursor": latest}, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
+                sent, last_sent = latest, time.monotonic()
+    finally:
+        kw.close()
+
+
 # ---------------------------------------------------------------- app / browser listing
 def icon_dirs():
     home = os.path.expanduser("~")
@@ -673,6 +733,8 @@ def main(argv):
     cmd = a[0]
     if cmd == "--watch":
         return watch("--parent-stdin" in a)
+    if cmd == "--cursor-watch":
+        return cursor_watch("--parent-stdin" in a)
     if cmd in ("--get", "--cursor"):
         what = cmd[2:]
         out = query_daemon("get" if what == "get" else "cursor") or direct("get" if what == "get" else "cursor")
