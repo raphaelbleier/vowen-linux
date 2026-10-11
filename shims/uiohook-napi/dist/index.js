@@ -40,8 +40,15 @@ const lib = (() => {
             }
         });
     }
+    // chords the app wants hidden from other apps, per source; replayed when the helper (re)starts
+    const swallow = new Map();
+    const sendSwallow = (source) => {
+        if (child) child.stdin.write(JSON.stringify({ cmd: 'swallow', source, chords: swallow.get(source) || [] }) + '\n');
+    };
     return {
-        start(handler) { if (!child) launch(0, handler); },
+        setSwallow(source, chords) { swallow.set(source, chords); sendSwallow(source); },
+        replaySwallow() { for (const s of swallow.keys()) sendSwallow(s); },
+        start(handler) { if (!child) { launch(0, handler); this.replaySwallow(); } },
         stop() { if (child) { child.stdin.end(); child.kill('SIGTERM'); child = null; } },
         keyTap(key, toggle) {
             if (child) child.stdin.write(JSON.stringify({ cmd: 'key', key, toggle }) + '\n');
@@ -195,6 +202,26 @@ exports.UiohookKey = {
     ScrollLock: 0x0046,
     PrintScreen: 0x0E37,
 };
+const ACCEL_MODS = { ctrl: 'ctrl', control: 'ctrl', commandorcontrol: 'ctrl', cmdorctrl: 'ctrl', alt: 'alt', option: 'alt',
+    altgr: 'alt', shift: 'shift', command: 'meta', cmd: 'meta', super: 'meta', meta: 'meta' };
+const ACCEL_KEYS = { return: 'Enter', enter: 'Enter', esc: 'Escape', escape: 'Escape', up: 'ArrowUp', down: 'ArrowDown',
+    left: 'ArrowLeft', right: 'ArrowRight', plus: 'Equal', ';': 'Semicolon', '=': 'Equal', ',': 'Comma', '-': 'Minus',
+    '.': 'Period', '/': 'Slash', '`': 'Backquote', '[': 'BracketLeft', '\\': 'Backslash', ']': 'BracketRight', "'": 'Quote' };
+function parseAccelerators(list) {
+    const out = [];
+    for (const a of list || []) {
+        const mods = new Set();
+        let key = null;
+        for (const tok of String(a).split('+')) {
+            const m = ACCEL_MODS[tok.toLowerCase()];
+            if (m) { mods.add(m); continue; }
+            const name = ACCEL_KEYS[tok.toLowerCase()] || (tok.length === 1 ? tok.toUpperCase() : tok);
+            key = exports.UiohookKey[name];
+        }
+        if (key !== undefined && key !== null) out.push({ mods: [...mods], key });
+    }
+    return out;
+}
 class UiohookNapi extends events_1.EventEmitter {
     handler(e) {
         this.emit('input', e);
@@ -242,9 +269,39 @@ class UiohookNapi extends events_1.EventEmitter {
             lib.keyTap(modifiers[i], KeyToggle.Up);
         }
     }
+    /**
+     * Linux port: hide these Electron-style accelerators ("Ctrl+Shift+H", "Escape") from other apps.
+     * Only effective when vowen-input runs with VOWEN_SWALLOW=1 (opt-in, see helpers/vowen-input).
+     * Modifier-only accelerators are ignored (modifiers always pass through).
+     */
+    setSwallow(source, accelerators) {
+        lib.setSwallow(String(source), parseAccelerators(accelerators));
+    }
+    /** Linux port: global cursor position {x, y} (KWin logical px) via vowen-input -> vowen-activewin. */
+    getCursorPos() {
+        return new Promise((resolve, reject) => {
+            const sock = require('net').connect(process.env.VOWEN_INPUT_SOCK || (0, path_1.join)(process.env.XDG_RUNTIME_DIR || '/tmp', 'vowen-input.sock'));
+            let buf = '';
+            const timer = setTimeout(() => { sock.destroy(); reject(new Error('cursor query timed out')); }, 5000);
+            sock.on('error', (e) => { clearTimeout(timer); reject(e); });
+            sock.on('connect', () => sock.write('{"cmd":"cursor"}\n'));
+            sock.on('data', (d) => {
+                buf += d;
+                if (buf.indexOf('\n') < 0) return;
+                clearTimeout(timer);
+                sock.end();
+                try {
+                    const r = JSON.parse(buf);
+                    r.ok ? resolve({ x: r.x, y: r.y }) : reject(new Error(r.error || 'cursor unavailable'));
+                } catch (e) { reject(e); }
+            });
+        });
+    }
     keyToggle(key, toggle) {
         lib.keyTap(key, (toggle === 'down' ? KeyToggle.Down : KeyToggle.Up));
     }
 }
 exports.uIOhook = new UiohookNapi();
+// main-bundle patch (active-app.patch.mjs) calls this without importing the shim
+globalThis.__vowenSetSwallow = (source, accelerators) => exports.uIOhook.setSwallow(source, accelerators);
 //# sourceMappingURL=index.js.map

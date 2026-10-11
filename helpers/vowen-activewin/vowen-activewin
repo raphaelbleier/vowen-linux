@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""vowen-activewin: active-window detection + installed-app/browser listing for Linux (stdlib only).
+
+  vowen-activewin --watch [--parent-stdin]   NDJSON on stdout for every focus change; serves the socket below
+  vowen-activewin --get                      one JSON record (asks a running --watch daemon, else queries directly)
+  vowen-activewin --cursor                   {"x":..,"y":..} global cursor position (KWin logical px; X11 fallback)
+  vowen-activewin --list-apps | --list-browsers | --list-profiles KEY | --icon DESKTOP_ID    JSON for the settings UI
+Record: {appName, windowTitle, appPath, bundleId, pid, wmClass}. bundleId = lowercase desktop-file id
+(org.kde.konsole), else the lowercase window class. Backends: KDE Plasma Wayland/X11 (KWin script over D-Bus, the
+script calls back into a D-Bus service this process owns), generic X11 (xprop). GNOME Wayland has no API for
+other apps' windows: empty record, exit code 4 in --watch.
+Socket $XDG_RUNTIME_DIR/vowen-activewin.sock: line "get" -> record, line "cursor" -> {"x","y"}.
+"""
+import base64, glob, json, os, re, selectors, shlex, shutil, signal, socket, struct, subprocess, sys, time
+
+BUS_NAME = "org.vowen.ActiveWin.p%d" % os.getpid()
+OBJ_PATH = "/org/vowen/ActiveWin"
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+SOCK_PATH = os.environ.get("VOWEN_ACTIVEWIN_SOCK") or os.path.join(RUNTIME, "vowen-activewin.sock")
+EMPTY = {"appName": "", "windowTitle": "", "appPath": "", "bundleId": "", "pid": 0, "wmClass": ""}
+
+# ---------------------------------------------------------------- minimal D-Bus (session bus, little endian)
+class Bus:
+    def __init__(self):
+        addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS") or "unix:path=/run/user/%d/bus" % os.getuid()
+        m = re.search(r"unix:(?:[^;]*,)?path=([^,;]+)", addr)
+        if not m:
+            raise OSError("no unix session bus address")
+        self.s = socket.socket(socket.AF_UNIX)
+        self.s.connect(m.group(1))
+        self.s.sendall(b"\0AUTH EXTERNAL " + str(os.getuid()).encode().hex().encode() + b"\r\n")
+        if not self._line().startswith(b"OK"):
+            raise OSError("dbus auth rejected")
+        self.s.sendall(b"BEGIN\r\n")
+        self.buf, self.serial, self.pending = b"", 0, []
+        self.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "Hello")
+
+    def _line(self):
+        d = b""
+        while not d.endswith(b"\r\n"):
+            c = self.s.recv(1)
+            if not c:
+                raise OSError("dbus closed")
+            d += c
+        return d
+
+    @staticmethod
+    def _pad(b, n): return b + b"\0" * (-len(b) % n)
+
+    def _send(self, mtype, flags, fields, sig, body):
+        self.serial += 1
+        if sig:
+            fields = fields + [(8, "g", sig)]
+        f = b""
+        for code, fsig, val in fields:
+            f = self._pad(f, 8) + bytes([code, 1]) + fsig.encode() + b"\0"
+            if fsig in "os":
+                e = val.encode()
+                f = self._pad(f, 4) + struct.pack("<I", len(e)) + e + b"\0"
+            elif fsig == "u":
+                f = self._pad(f, 4) + struct.pack("<I", val)
+            else:  # "g"
+                f += bytes([len(val)]) + val.encode() + b"\0"
+        head = struct.pack("<BBBBIII", ord("l"), mtype, flags, 1, len(body), self.serial, len(f)) + f
+        self.s.sendall(self._pad(head, 8) + body)
+        return self.serial
+
+    def call(self, dest, path, iface, member, sig="", args=(), timeout=3.0, reply=True):
+        body = b""
+        for t, v in zip(sig, args):
+            if t == "s":
+                body = self._pad(body, 4) + struct.pack("<I", len(v.encode())) + v.encode() + b"\0"
+            elif t == "u":
+                body = self._pad(body, 4) + struct.pack("<I", v)
+        n = self._send(1, 0 if reply else 1, [(1, "o", path), (2, "s", iface), (3, "s", member), (6, "s", dest)], sig, body)
+        if not reply:
+            return None
+        end = time.monotonic() + timeout
+        while True:
+            m = self.read(max(0.01, end - time.monotonic()), queued=False)
+            if m is None:
+                raise TimeoutError("%s.%s timed out" % (iface, member))
+            if m["type"] in (2, 3) and m["f"].get(5) == n:
+                if m["type"] == 3:
+                    raise OSError("%s: %s" % (m["f"].get(4), m["args"][:1]))
+                return m["args"]
+            self.pending.append(m)
+
+    def read(self, timeout=None, queued=True):
+        """Next message (queued first). Returns None on timeout."""
+        if queued and self.pending:
+            return self.pending.pop(0)
+        end = None if timeout is None else time.monotonic() + timeout
+        while True:
+            m = self._parse()
+            if m:
+                return m
+            self.s.settimeout(None if end is None else max(0.001, end - time.monotonic()))
+            try:
+                d = self.s.recv(65536)
+            except (socket.timeout, BlockingIOError):
+                return None
+            if not d:
+                raise OSError("dbus closed")
+            self.buf += d
+
+    def _parse(self):
+        b = self.buf
+        if len(b) < 16:
+            return None
+        _, mtype, flags, _, blen, serial, flen = struct.unpack_from("<BBBBIII", b)
+        hend = 16 + flen
+        total = hend + (-hend % 8) + blen
+        if len(b) < total:
+            return None
+        self.buf = b[total:]
+        fields, i = {}, 16
+        while i < hend:
+            i += -i % 8
+            code, sl = b[i], b[i + 1]
+            fsig = b[i + 2:i + 2 + sl].decode()
+            i += 3 + sl
+            if fsig in ("o", "s"):
+                i += -i % 4
+                (n,) = struct.unpack_from("<I", b, i)
+                fields[code] = b[i + 4:i + 4 + n].decode()
+                i += 5 + n
+            elif fsig == "u":
+                i += -i % 4
+                (fields[code],) = struct.unpack_from("<I", b, i)
+                i += 4
+            elif fsig == "g":
+                n = b[i]
+                fields[code] = b[i + 1:i + 1 + n].decode()
+                i += 2 + n
+            else:
+                raise OSError("unsupported header field type " + fsig)
+        j, args = hend + (-hend % 8), []
+        for t in fields.get(8, ""):
+            if t in ("s", "o"):
+                j += -j % 4
+                (n,) = struct.unpack_from("<I", b, j)
+                args.append(b[j + 4:j + 4 + n].decode()); j += 5 + n
+            elif t in ("u", "i", "b"):
+                j += -j % 4
+                args.append(struct.unpack_from("<I" if t == "u" else "<i", b, j)[0]); j += 4
+            else:
+                break
+        return {"type": mtype, "flags": flags, "serial": serial, "f": fields, "args": args}
+
+    def serve_reply(self, m):
+        if not m["flags"] & 1:  # NO_REPLY_EXPECTED
+            self._send(2, 1, [(5, "u", m["serial"]), (6, "s", m["f"].get(7, ""))], "", b"")
+
+
+# ---------------------------------------------------------------- desktop-file index
+def app_dirs():
+    home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    dirs = [home] + (os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share").split(":")
+    dirs += ["/var/lib/flatpak/exports/share", home + "/flatpak/exports/share",
+             "/var/lib/snapd/desktop"]
+    return [d for d in dict.fromkeys(dirs) if d]
+
+
+def parse_desktop(path):
+    lang = (os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "en").split(".")[0]
+    keys, inside = {}, False
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln.startswith("["):
+                    inside = ln == "[Desktop Entry]"
+                    if not inside and keys:
+                        break
+                elif inside and "=" in ln and not ln.startswith("#"):
+                    k, v = ln.split("=", 1)
+                    keys[k.strip()] = v.strip()
+    except OSError:
+        return None
+    if keys.get("Type") != "Application":
+        return None
+    name = keys.get("Name[%s]" % lang) or keys.get("Name[%s]" % lang.split("_")[0]) or keys.get("Name", "")
+    return {"name": name, "exec": keys.get("Exec", ""), "icon": keys.get("Icon", ""),
+            "wmclass": keys.get("StartupWMClass", ""), "hidden": keys.get("NoDisplay") == "true" or keys.get("Hidden") == "true",
+            "path": path}
+
+
+def exec_bin(cmd):
+    try:
+        argv = [a for a in shlex.split(cmd) if not re.fullmatch(r"%[a-zA-Z]", a)]
+    except ValueError:
+        return ""
+    while argv and (argv[0] == "env" or "=" in argv[0].split("/")[-1] and not argv[0].startswith("/")):
+        argv.pop(0)
+    return argv[0] if argv else ""
+
+
+def load_index():
+    """{desktop-id(lowercase): entry}; user dirs win over system dirs."""
+    idx = {}
+    for base in app_dirs():
+        root = os.path.join(base, "applications")
+        for dp, _dn, fn in os.walk(root):
+            for n in fn:
+                if not n.endswith(".desktop"):
+                    continue
+                full = os.path.join(dp, n)
+                did = os.path.relpath(full, root)[:-8].replace("/", "-").lower()
+                if did not in idx:
+                    e = parse_desktop(full)
+                    if e:
+                        e["id"] = did
+                        e["bin"] = exec_bin(e["exec"])
+                        idx[did] = e
+    return idx
+
+
+def resolve(idx, df, cls, rname, exe):
+    """Window -> desktop entry: desktopFileName, StartupWMClass, exec basename."""
+    for k in (df, df.split(".")[-1] if df else ""):
+        if k and k.lower().removesuffix(".desktop") in idx:
+            return idx[k.lower().removesuffix(".desktop")]
+    cands = {x.lower() for x in (cls, rname, df) if x}
+    exe_b = os.path.basename(exe).lower() if exe else ""
+    for e in idx.values():
+        if e["wmclass"] and e["wmclass"].lower() in cands:
+            return e
+    for e in idx.values():
+        b = os.path.basename(e["bin"]).lower()
+        if b and (b in cands or (exe_b and b == exe_b)):
+            return e
+    for c in cands:  # reverse-DNS id ending in the class (org.kde.konsole <- konsole)
+        for did, e in idx.items():
+            if did.endswith("." + c):
+                return e
+    return None
+
+
+_IDX = None
+
+
+def make_record(raw):
+    """raw: {cls,rname,cap,pid,df} from the backend."""
+    global _IDX
+    if _IDX is None:
+        _IDX = load_index()
+    pid = int(raw.get("pid") or 0)
+    exe = ""
+    if pid:
+        try:
+            exe = os.readlink("/proc/%d/exe" % pid)
+        except OSError:
+            pass
+    e = resolve(_IDX, raw.get("df") or "", raw.get("cls") or "", raw.get("rname") or "", exe)
+    cls = raw.get("cls") or raw.get("rname") or ""
+    bid = (e["id"] if e else (raw.get("df") or cls)).lower().removesuffix(".desktop")
+    return {"appName": (e and e["name"]) or cls, "windowTitle": raw.get("cap") or "",
+            "appPath": exe or (e["path"] if e else ""), "bundleId": bid, "pid": pid, "wmClass": cls.lower()}
+
+
+# ---------------------------------------------------------------- backends
+SCRIPT_ACTIVE = """
+function info(w) {
+  return JSON.stringify({cls: w.resourceClass || "", rname: w.resourceName || "", cap: w.caption || "",
+                         pid: w.pid || 0, df: w.desktopFileName || ""});
+}
+function rep(w) {
+  if (!w) return;
+  callDBus("%(n)s", "%(p)s", "%(n)s", "Active", info(w));
+}
+workspace.windowActivated.connect(rep);
+rep(workspace.activeWindow);
+"""
+SCRIPT_ONESHOT = """
+var w = workspace.activeWindow;
+if (w) callDBus("%(n)s", "%(p)s", "%(n)s", "Active", JSON.stringify({cls: w.resourceClass || "", rname: w.resourceName || "",
+  cap: w.caption || "", pid: w.pid || 0, df: w.desktopFileName || ""}));
+var c = workspace.cursorPos;
+callDBus("%(n)s", "%(p)s", "%(n)s", "Cursor", JSON.stringify({x: c.x, y: c.y}));
+"""
+
+
+class KWin:
+    """Owns a bus name; KWin scripts call back into it."""
+
+    def __init__(self):
+        self.bus = Bus()
+        if not self.bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s", ["org.kde.KWin"])[0]:
+            raise OSError("KWin not on the session bus")
+        self.bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName", "su", [BUS_NAME, 4])
+        self.loaded, self.files = [], []
+        self.last = None
+        self.cursor = None
+
+    def load(self, text, tag):
+        name = "vowen-activewin-%d-%s" % (os.getpid(), tag)
+        path = os.path.join(RUNTIME, name + ".js")
+        with open(path, "w") as f:
+            f.write(text % {"n": BUS_NAME, "p": OBJ_PATH})
+        self.files.append(path)
+        sc = "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting"
+        self.bus.call(sc[0], sc[1], sc[2], "unloadScript", "s", [name])
+        sid = self.bus.call(*sc, "loadScript", "ss", [path, name])[0]
+        self.bus.call("org.kde.KWin", "/Scripting/Script%d" % sid, "org.kde.kwin.Script", "run")
+        self.loaded.append(name)
+        return name
+
+    def unload(self, name):
+        try:
+            self.bus.call("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting", "unloadScript", "s", [name], timeout=1)
+        except (OSError, TimeoutError):
+            pass
+        if name in self.loaded:
+            self.loaded.remove(name)
+
+    def pump(self, m):
+        """Handle one incoming message; returns record dict if it was an Active report."""
+        if m["type"] != 1 or m["f"].get(3) not in ("Active", "Cursor"):
+            return None
+        self.bus.serve_reply(m)
+        try:
+            d = json.loads(m["args"][0])
+        except (IndexError, ValueError):
+            return None
+        if m["f"][3] == "Cursor":
+            self.cursor = d
+            return None
+        return make_record(d)
+
+    def wait(self, want, timeout=2.0, on_active=None):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            m = self.bus.read(max(0.01, end - time.monotonic()))
+            if m is None:
+                break
+            rec = self.pump(m)
+            if rec:
+                self.last = rec
+                if on_active:
+                    on_active(rec)
+            if (want == "active" and rec) or (want == "cursor" and self.cursor):
+                return True
+        return False
+
+    def oneshot(self):
+        self.cursor = None
+        n = self.load(SCRIPT_ONESHOT, "o%d" % time.monotonic_ns())
+        try:
+            self.wait("cursor", 2.0)
+        finally:
+            self.unload(n)
+        return self.last, self.cursor
+
+    def close(self):
+        for n in list(self.loaded):
+            self.unload(n)
+        for f in self.files:
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+
+def xprop(*a):
+    try:
+        return subprocess.run(["xprop", *a], capture_output=True, text=True, timeout=2).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def x11_active():
+    if not (os.environ.get("DISPLAY") and shutil.which("xprop")):
+        return None
+    m = re.search(r"window id # (0x[0-9a-f]+)", xprop("-root", "_NET_ACTIVE_WINDOW"))
+    if not m or m.group(1) == "0x0":
+        return dict(EMPTY)
+    out = xprop("-id", m.group(1), "WM_CLASS", "_NET_WM_PID", "_NET_WM_NAME", "WM_NAME")
+    cls = re.search(r'WM_CLASS\(STRING\) = "([^"]*)", "([^"]*)"', out)
+    pid = re.search(r"_NET_WM_PID\(CARDINAL\) = (\d+)", out)
+    cap = re.search(r'_NET_WM_NAME\(UTF8_STRING\) = "(.*)"', out) or re.search(r'WM_NAME\(STRING\) = "(.*)"', out)
+    return make_record({"cls": cls.group(2) if cls else "", "rname": cls.group(1) if cls else "",
+                        "cap": cap.group(1) if cap else "", "pid": int(pid.group(1)) if pid else 0})
+
+
+def x11_cursor():
+    if shutil.which("xdotool") and os.environ.get("DISPLAY"):
+        m = re.search(r"x:(\d+) y:(\d+)", subprocess.run(["xdotool", "getmouselocation"], capture_output=True, text=True).stdout)
+        if m:
+            return {"x": int(m.group(1)), "y": int(m.group(2))}
+    return None
+
+
+def query_daemon(cmd):
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(3)
+            s.connect(SOCK_PATH)
+            s.sendall(cmd.encode() + b"\n")
+            return json.loads(s.makefile().readline())
+    except (OSError, ValueError):
+        return None
+
+
+def direct(what):
+    try:
+        k = KWin()
+    except (OSError, TimeoutError):
+        return x11_active() if what == "get" else x11_cursor()
+    try:
+        rec, cur = k.oneshot()
+    finally:
+        k.close()
+    return (rec or dict(EMPTY)) if what == "get" else cur
+
+
+# ---------------------------------------------------------------- watch daemon
+def watch(parent_stdin):
+    emit_last = [None]
+
+    def emit(rec):
+        key = json.dumps(rec, sort_keys=True)
+        if key != emit_last[0]:
+            emit_last[0] = key
+            sys.stdout.write(json.dumps(rec, separators=(",", ":")) + "\n")
+            sys.stdout.flush()
+
+    kw, spy = None, None
+    try:
+        kw = KWin()
+        kw.load(SCRIPT_ACTIVE, "w")
+    except (OSError, TimeoutError) as e:
+        kw = None
+        print("vowen-activewin: KWin unavailable (%s)" % e, file=sys.stderr)
+        if x11_active() is None:
+            print("vowen-activewin: no supported backend (GNOME Wayland has no API for other apps' windows)", file=sys.stderr)
+            return 4
+        spy = subprocess.Popen(["xprop", "-spy", "-root", "_NET_ACTIVE_WINDOW"], stdout=subprocess.PIPE, text=True, bufsize=1)
+    try:
+        os.unlink(SOCK_PATH)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(SOCK_PATH)
+    os.chmod(SOCK_PATH, 0o600)
+    srv.listen(8)
+    sel = selectors.DefaultSelector()
+    sel.register(srv, selectors.EVENT_READ, "srv")
+    if kw:
+        sel.register(kw.bus.s, selectors.EVENT_READ, "bus")
+    if spy:
+        sel.register(spy.stdout, selectors.EVENT_READ, "spy")
+    if parent_stdin:
+        sel.register(0, selectors.EVENT_READ, "stdin")
+    cur_rec = [dict(EMPTY)]
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    def on_active(rec):
+        cur_rec[0] = rec
+        emit(rec)
+
+    def drain():
+        while kw:
+            m = kw.bus.pending.pop(0) if kw.bus.pending else kw.bus._parse()
+            if not m:
+                break
+            rec = kw.pump(m)
+            if rec:
+                on_active(rec)
+
+    try:
+        drain()  # reports that arrived while the script was being started
+        while True:
+            for k, _ in sel.select(timeout=30):
+                if k.data == "bus":
+                    kw.bus.s.setblocking(False)
+                    try:
+                        d = kw.bus.s.recv(65536)
+                    except BlockingIOError:
+                        d = None
+                    if d == b"":
+                        return 5
+                    if d:
+                        kw.bus.buf += d
+                    drain()
+                elif k.data == "spy":
+                    if not spy.stdout.readline():
+                        return 5
+                    rec = x11_active()
+                    if rec:
+                        on_active(rec)
+                elif k.data == "stdin":
+                    if not os.read(0, 4096):
+                        return 0
+                else:
+                    c, _a = srv.accept()
+                    c.settimeout(2)
+                    try:
+                        cmd = c.makefile().readline().strip()
+                        if cmd == "get":
+                            out = cur_rec[0]
+                        elif cmd == "cursor":
+                            if kw:
+                                kw.cursor = None
+                                n = kw.load(SCRIPT_ONESHOT, "c%d" % time.monotonic_ns())
+                                kw.bus.s.settimeout(None)
+                                kw.wait("cursor", 3.0, on_active)
+                                kw.unload(n)
+                                drain()
+                                out = kw.cursor
+                            else:
+                                out = x11_cursor()
+                            out = out or {"error": "no cursor backend"}
+                        else:
+                            out = {"error": "unknown cmd"}
+                        c.sendall(json.dumps(out).encode() + b"\n")
+                    except OSError:
+                        pass
+                    finally:
+                        c.close()
+    finally:
+        if spy:
+            spy.terminate()
+        if kw:
+            kw.close()
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- app / browser listing
+def icon_dirs():
+    home = os.path.expanduser("~")
+    theme = "breeze"
+    try:
+        with open(os.path.join(os.environ.get("XDG_CONFIG_HOME") or home + "/.config", "kdeglobals")) as f:
+            m = re.search(r"^\[Icons\]\s*\n(?:.*\n)*?Theme=(\S+)", f.read(), re.M)
+            theme = m.group(1) if m else theme
+    except OSError:
+        pass
+    roots = [os.path.join(home, ".icons"), os.path.join(os.environ.get("XDG_DATA_HOME") or home + "/.local/share", "icons")]
+    roots += [os.path.join(d, "icons") for d in app_dirs()]
+    names = list(dict.fromkeys([theme, "hicolor", "breeze", "Adwaita"]))
+    return [os.path.join(r, n) for n in names for r in roots if os.path.isdir(os.path.join(r, n))]
+
+
+_ICONS = None
+
+
+def icon_index():
+    """icon name -> (score, path); lower score = closer to 64px, scalable best."""
+    global _ICONS
+    if _ICONS is not None:
+        return _ICONS
+    idx = {}
+    for order, base in enumerate(icon_dirs()):
+        for dp, _dn, fn in os.walk(base):
+            parts = dp[len(base):].split(os.sep)
+            if "apps" not in parts:
+                continue
+            size = next((int(re.match(r"\d+", p).group()) for p in parts if re.match(r"\d+(x\d+)?(@\d+x?)?$", p)), None)
+            for n in fn:
+                stem, ext = os.path.splitext(n)
+                if ext not in (".png", ".svg"):
+                    continue
+                sc = (order, 0 if ext == ".svg" else abs((size or 0) - 64) + 1)
+                if stem not in idx or sc < idx[stem][0]:
+                    idx[stem] = (sc, os.path.join(dp, n))
+    _ICONS = idx
+    return idx
+
+
+def icon_data(name):
+    if not name:
+        return None
+    p = name if os.path.isabs(name) else (icon_index().get(name) or (None, None))[1]
+    if not p:
+        for ext in (".png", ".svg", ".xpm"):
+            c = "/usr/share/pixmaps/" + name + ext
+            if os.path.exists(c):
+                p = c
+                break
+    if not p or not p.endswith((".png", ".svg")):
+        return None
+    try:
+        if os.path.getsize(p) > 200000:
+            return None
+        with open(p, "rb") as f:
+            return "data:image/%s;base64,%s" % ("svg+xml" if p.endswith(".svg") else "png", base64.b64encode(f.read()).decode())
+    except OSError:
+        return None
+
+
+def list_apps():
+    out = []
+    for e in sorted(load_index().values(), key=lambda e: e["name"].lower()):
+        if e["hidden"] or not e["name"] or not e["bin"]:
+            continue
+        out.append({"name": e["name"], "bundleId": e["id"], "path": shutil.which(e["bin"]) or e["bin"], "icon": icon_data(e["icon"])})
+    return out
+
+
+# key (patched UI table) -> (desktop ids, family, data dirs relative to $HOME/.config unless noted)
+BROWSERS = {
+    "chrome": (["google-chrome", "com.google.chrome"], "chromium", "google-chrome"),
+    "chrome-beta": (["google-chrome-beta"], "chromium", "google-chrome-beta"),
+    "chrome-canary": (["google-chrome-unstable"], "chromium", "google-chrome-unstable"),
+    "edge": (["microsoft-edge", "com.microsoft.edge"], "chromium", "microsoft-edge"),
+    "edge-beta": (["microsoft-edge-beta"], "chromium", "microsoft-edge-beta"),
+    "brave": (["brave-browser", "com.brave.browser"], "chromium", "BraveSoftware/Brave-Browser"),
+    "brave-beta": (["brave-browser-beta"], "chromium", "BraveSoftware/Brave-Browser-Beta"),
+    "vivaldi": (["vivaldi-stable", "com.vivaldi.vivaldi"], "chromium", "vivaldi"),
+    "opera": (["opera", "com.opera.opera"], "chromium", "opera"),
+    "chromium": (["chromium", "chromium-browser", "org.chromium.chromium"], "chromium", "chromium"),
+    "firefox": (["firefox", "org.mozilla.firefox", "firefox_firefox"], "gecko", "~/.mozilla/firefox|~/snap/firefox/common/.mozilla/firefox|~/.var/app/org.mozilla.firefox/.mozilla/firefox"),
+    "firefox-dev": (["firefox-developer-edition", "firefox-aurora"], "gecko", "~/.mozilla/firefox"),
+    "zen": (["zen", "app.zen_browser.zen", "zen-browser"], "gecko", "~/.zen"),
+    "librewolf": (["librewolf", "io.gitlab.librewolf-community"], "gecko", "~/.librewolf"),
+}
+NAMES = {"chrome": "Google Chrome", "chrome-beta": "Google Chrome Beta", "chrome-canary": "Google Chrome Canary",
+         "edge": "Microsoft Edge", "edge-beta": "Microsoft Edge Beta", "brave": "Brave", "brave-beta": "Brave Beta",
+         "vivaldi": "Vivaldi", "opera": "Opera", "chromium": "Chromium", "firefox": "Firefox",
+         "firefox-dev": "Firefox Developer Edition", "zen": "Zen Browser", "librewolf": "LibreWolf"}
+
+
+def list_browsers():
+    idx, out = load_index(), []
+    for key, (ids, fam, _d) in BROWSERS.items():
+        e = next((idx[i] for i in ids if i in idx), None)
+        if e and e["bin"]:
+            out.append({"key": key, "name": NAMES[key], "family": fam, "path": shutil.which(e["bin"]) or e["bin"],
+                        "bundleId": e["id"], "icon": icon_data(e["icon"]),
+                        "hasProfiles": len(list_profiles(key)) > 1})
+    return sorted(out, key=lambda b: b["name"].lower())
+
+
+def list_profiles(key):
+    if key not in BROWSERS:
+        return []
+    fam, d = BROWSERS[key][1], BROWSERS[key][2]
+    bases = [os.path.expanduser(x) if x.startswith("~") else os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), x)
+             for x in d.split("|")]
+    base = next((b for b in bases if os.path.exists(os.path.join(b, "profiles.ini" if fam == "gecko" else "Local State"))), bases[0])
+    try:
+        if fam == "chromium":
+            with open(os.path.join(base, "Local State"), encoding="utf-8") as f:
+                prof = json.load(f).get("profile", {})
+            cache, order = prof.get("info_cache") or {}, prof.get("profiles_order") or []
+            keys = [k for k in order if k in cache] + [k for k in cache if k not in order]
+            return [{"dir": k, "name": cache[k].get("name") or k, "email": cache[k].get("user_name") or None}
+                    for k in keys if not cache[k].get("is_ephemeral")]
+        names, sect = [], None
+        with open(os.path.join(base, "profiles.ini"), encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                m = re.match(r"^\[(.+)\]$", ln)
+                if m:
+                    sect = m.group(1)
+                elif sect and re.match(r"Profile\d+$", sect, re.I) and ln.lower().startswith("name="):
+                    names.append(ln.split("=", 1)[1].strip())
+        return [{"dir": n, "name": n, "email": None} for n in names]
+    except (OSError, ValueError, AttributeError):
+        return []
+
+
+def main(argv):
+    os.closerange(3, 256)  # do not keep fds inherited from the Electron parent
+    a = argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cmd = a[0]
+    if cmd == "--watch":
+        return watch("--parent-stdin" in a)
+    if cmd in ("--get", "--cursor"):
+        what = cmd[2:]
+        out = query_daemon("get" if what == "get" else "cursor") or direct("get" if what == "get" else "cursor")
+        print(json.dumps(out if out is not None else ({"error": "unavailable"} if what == "cursor" else dict(EMPTY))))
+        return 0
+    if cmd == "--list-apps":
+        print(json.dumps(list_apps()))
+    elif cmd == "--list-browsers":
+        print(json.dumps(list_browsers()))
+    elif cmd == "--icon" and len(a) > 1:
+        e = load_index().get(a[1].lower())
+        print(json.dumps({"icon": icon_data(e["icon"]) if e else None}))
+    elif cmd == "--list-profiles" and len(a) > 1:
+        print(json.dumps(list_profiles(a[1])))
+    else:
+        print("unknown option", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -11,11 +11,15 @@ const { uIOhook } = require('../shims/uiohook-napi/dist/index.js');
 const seen = [];
 uIOhook.on('keydown', e => seen.push(e));
 uIOhook.start();
+uIOhook.setSwallow('hotkeys', ['Ctrl+Shift+H', 'Escape', 'Ctrl+Shift', 'Alt+Return', 'CommandOrControl+F5']);
 uIOhook.keyToggle(0x2F, 'down');
 uIOhook.keyToggle(0x2F, 'up');
 setTimeout(() => {
   assert.strictEqual(seen.length, 1); assert.strictEqual(seen[0].keycode, 29); assert.strictEqual(seen[0].ctrlKey, true);
   const cmds = fs.readFileSync(dir + '/cmds', 'utf8').trim().split('\n').map(JSON.parse);
-  assert.deepStrictEqual(cmds, [{ cmd: 'key', key: 47, toggle: 1 }, { cmd: 'key', key: 47, toggle: 2 }]);
+  assert.deepStrictEqual(cmds, [
+    { cmd: 'swallow', source: 'hotkeys', chords: [
+      { mods: ['ctrl', 'shift'], key: 0x23 }, { mods: [], key: 1 }, { mods: ['alt'], key: 0x1C }, { mods: ['ctrl'], key: 0x3F }] },
+    { cmd: 'key', key: 47, toggle: 1 }, { cmd: 'key', key: 47, toggle: 2 }]);
   uIOhook.stop(); console.log('ok');
 }, 800);

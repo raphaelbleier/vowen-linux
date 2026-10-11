@@ -5,14 +5,21 @@ stdout : NDJSON events in uiohook-napi shape (type 4/5 key, 6/7/8 mouse), see tr
 stdin  : {"cmd":"key","key":<uiohook code>,"toggle":0 tap|1 down|2 up}; EOF = parent died -> exit.
 socket : $XDG_RUNTIME_DIR/vowen-input.sock, evdev-code commands (chord/tap/ping), see notes/CONTEXT.md.
 exit 13: no input device readable and no uinput (missing permissions).
+
+Optional key swallowing (opt-in, VOWEN_SWALLOW=1): {"cmd":"swallow","source":"hotkeys","chords":[{"mods":["ctrl","shift"],
+"key":<uiohook code>}]} registers chords whose final (non-modifier) key must not reach other apps. While any chord is
+registered the physical keyboards are EVIOCGRABbed and every key is re-emitted on a mirror uinput device, except the
+swallowed ones. Safety: grab is released by the kernel if this process dies; a watchdog thread ungrabs everything
+if the main loop stalls for more than 2 s; VOWEN_GRAB_NAME=<regex> restricts which devices are grabbed (tests).
+Socket/stdin {"cmd":"cursor"} -> {"ok":true,"x":..,"y":..} (global cursor position via vowen-activewin).
 """
-import errno, fcntl, json, os, selectors, signal, socket, struct, sys, time
+import errno, fcntl, json, os, re, selectors, signal, socket, struct, subprocess, sys, threading, time
 
 EV_SYN, EV_KEY = 0, 1
 KEY_MAX = 0x2ff
 OWN_NAME = b"vowen-input virtual keyboard"
 EVENT = struct.Struct("llHHi")  # struct input_event on 64-bit linux
-SOCK_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "vowen-input.sock")
+SOCK_PATH = os.environ.get("VOWEN_INPUT_SOCK") or os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "vowen-input.sock")
 
 # evdev -> uiohook. Codes 1..0x58 are identical; only the differing ones are listed.
 EXTENDED = {
@@ -75,14 +82,29 @@ UI_SET_EVBIT, UI_SET_KEYBIT = _ioc(1, "U", 100, 4), _ioc(1, "U", 101, 4)
 UI_DEV_SETUP, UI_DEV_CREATE = _ioc(1, "U", 3, 92), _ioc(0, "U", 1, 0)
 
 
-def classify(fd):
-    """'kbd' / 'mouse' / None (also None for our own virtual device)."""
+def eviocgkey(n): return _ioc(2, "E", 0x18, n)
+def eviocgphys(n): return _ioc(2, "E", 0x07, n)
+EVIOCGRAB = _ioc(1, "E", 0x90, 4)
+KEY_UNKNOWN = 240
+
+
+def devinfo(fd):
+    """(kind, name, phys, keybits); kind is 'kbd' / 'mouse' / None (also None for our own virtual devices)."""
     name = fcntl.ioctl(fd, eviocgname(256), bytes(256)).split(b"\0")[0]
     if name == OWN_NAME:
-        return None
+        return None, name.decode(), "", b""
     bits = fcntl.ioctl(fd, eviocgbit(EV_KEY, KEY_MAX // 8 + 1), bytes(KEY_MAX // 8 + 1))
     has = lambda k: bits[k // 8] >> (k % 8) & 1
-    return "kbd" if has(30) else "mouse" if has(0x110) else None  # KEY_A / BTN_LEFT
+    kind = "kbd" if has(30) else "mouse" if has(0x110) else None  # KEY_A / BTN_LEFT
+    try:
+        phys = fcntl.ioctl(fd, eviocgphys(256), bytes(256)).split(b"\0")[0].decode(errors="replace")
+    except OSError:
+        phys = ""
+    return kind, name.decode(errors="replace"), phys, bits
+
+
+def classify(fd):
+    return devinfo(fd)[0]
 
 
 class Injector:
@@ -142,9 +164,164 @@ class Injector:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+class Mirror:
+    """uinput clone of a grabbed keyboard; everything not swallowed is replayed here."""
+
+    def __init__(self, bits):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        self.down = set()
+        try:
+            fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+            for k in range(1, KEY_MAX):
+                if bits[k // 8] >> (k % 8) & 1 and not 0x100 <= k < 0x160 and k < 0x2c0:
+                    fcntl.ioctl(self.fd, UI_SET_KEYBIT, k)
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, KEY_UNKNOWN)
+            fcntl.ioctl(self.fd, UI_DEV_SETUP, struct.pack("HHHH80sI", 0x03, 0x1209, 0x0002, 1, OWN_NAME, 0))
+            fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        except OSError:
+            os.close(self.fd)
+            raise
+        time.sleep(0.2)
+
+    def key(self, code, down):
+        try:
+            os.write(self.fd, EVENT.pack(0, 0, EV_KEY, code, int(down)) + EVENT.pack(0, 0, EV_SYN, 0, 0))
+        except OSError:
+            return
+        (self.down.add if down else self.down.discard)(code)
+
+    def release_all(self):
+        for c in list(self.down):
+            self.key(c, False)
+
+    def close(self):
+        self.release_all()
+        os.close(self.fd)
+
+
+class Grabber:
+    """Chord swallowing via EVIOCGRAB + mirror device. Opt-in; see module docstring."""
+
+    def __init__(self, tr):
+        self.enabled = os.environ.get("VOWEN_SWALLOW", "").lower() in ("1", "true", "yes")
+        self.name_re = re.compile(os.environ["VOWEN_GRAB_NAME"]) if os.environ.get("VOWEN_GRAB_NAME") else None
+        self.tr = tr
+        self.sources = {}      # source -> set of (frozenset mods, evdev code)
+        self.chords = set()
+        self.grabbed = {}      # path -> (fd, Mirror)
+        self.swallowed = set()
+        self.lock = threading.Lock()
+        self.tick = time.monotonic()
+        self.tripped = False
+
+    def set(self, source, chords):
+        new = set()
+        for c in chords:
+            try:
+                key = TO_EVDEV[int(c["key"])]
+                mods = frozenset(m for m in c.get("mods", []) if m in ("ctrl", "shift", "alt", "meta"))
+            except (KeyError, TypeError, ValueError):
+                continue
+            new.add((mods, key))
+        self.sources[source] = new
+        self.chords = set().union(*self.sources.values())
+        self.tripped = False
+
+    def wanted(self, path, name, phys):
+        if self.name_re:
+            return bool(self.name_re.search(name))
+        return bool(phys)  # virtual uinput devices have no phys: never grab ydotool & co by default
+
+    def ensure(self, devs, names):
+        """Grab/ungrab to match the chord list. Returns nothing; safe to call often."""
+        if not self.enabled or self.tripped:
+            return
+        with self.lock:
+            if not self.chords:
+                self.release_all()
+                return
+            for path, fd in devs.items():
+                if path in self.grabbed or path not in names or names[path][0] != "kbd":
+                    continue
+                name, phys, bits = names[path][1:]
+                if not self.wanted(path, name, phys):
+                    continue
+                try:
+                    state = fcntl.ioctl(fd, eviocgkey(KEY_MAX // 8 + 1), bytes(KEY_MAX // 8 + 1))
+                    if any(state):  # a key is physically down: grabbing now could strand it, retry later
+                        continue
+                    m = Mirror(bits)
+                    try:
+                        fcntl.ioctl(fd, EVIOCGRAB, 1)
+                    except OSError:
+                        m.close()
+                        raise
+                    self.grabbed[path] = (fd, m)
+                except OSError as e:
+                    print(f"vowen-input: cannot grab {path}: {e}", file=sys.stderr)
+
+    def release_all(self):
+        for path in list(self.grabbed):
+            self.release(path)
+
+    def release(self, path):
+        fd, m = self.grabbed.pop(path, (None, None))
+        if m:
+            try:
+                fcntl.ioctl(fd, EVIOCGRAB, 0)
+            except (OSError, ValueError):
+                pass
+            m.close()
+
+    def filter(self, path, etype, code, value):
+        """For a grabbed device: replay the event unless it belongs to a swallowed chord. Returns True if swallowed."""
+        _fd, mirror = self.grabbed[path]
+        if etype != EV_KEY or value == 2:
+            return code in self.swallowed
+        swallow = False
+        if code in self.swallowed:
+            swallow = True
+            if value == 0:
+                self.swallowed.discard(code)
+        elif value == 1 and code not in MODS:
+            mods = frozenset({"shiftKey": "shift", "ctrlKey": "ctrl", "altKey": "alt", "metaKey": "meta"}[MODS[c]]
+                             for c in self.tr.held if c in MODS)
+            if (mods, code) in self.chords:
+                swallow = True
+                self.swallowed.add(code)
+                if mods & {"alt", "meta"}:  # keep Plasma/menus from treating the lone Alt/Meta release as a tap
+                    mirror.key(KEY_UNKNOWN, True)
+                    mirror.key(KEY_UNKNOWN, False)
+        if not swallow:
+            mirror.key(code, value == 1)
+        return swallow
+
+    def watchdog(self):
+        while True:
+            time.sleep(0.5)
+            if self.grabbed and time.monotonic() - self.tick > 2.0:
+                self.tripped = True
+                print("vowen-input: main loop stalled, releasing keyboard grab", file=sys.stderr)
+                self.release_all()
+
+
+def cursor_pos():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for c in (os.path.join(here, "vowen-activewin"), os.path.join(here, "..", "vowen-activewin", "vowen-activewin")):
+        if os.access(c, os.X_OK):
+            try:
+                r = json.loads(subprocess.run([c, "--cursor"], capture_output=True, timeout=4, close_fds=True).stdout)
+                return {"ok": True, **r} if "x" in r else {"ok": False, "error": r.get("error", "no cursor")}
+            except (OSError, ValueError, subprocess.SubprocessError) as e:
+                return {"ok": False, "error": str(e)}
+    return {"ok": False, "error": "vowen-activewin not found"}
+
+
 def main():
     sel = selectors.DefaultSelector()
     tr, inj = Translator(), Injector()
+    grab = Grabber(tr)
+    meta = {}  # path -> (kind, name, phys, bits)
     devs, rejected = {}, set()  # path -> fd ; paths not worth reopening
     denied = False
 
@@ -158,19 +335,23 @@ def main():
         for path in names - set(devs) - rejected:
             try:
                 fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-                kind = classify(fd)
+                info = devinfo(fd)
+                kind = info[0]
             except OSError as e:
                 rejected.add(path)
                 denied |= e.errno in (errno.EACCES, errno.EPERM)
                 continue
             if kind:
                 devs[path] = fd
+                meta[path] = info
                 sel.register(fd, selectors.EVENT_READ, ("dev", path))
             else:
                 os.close(fd)
                 rejected.add(path)
 
     def drop(path):
+        grab.release(path)
+        meta.pop(path, None)
         fd = devs.pop(path)
         sel.unregister(fd)
         os.close(fd)
@@ -210,6 +391,20 @@ def main():
     bufs[0] = b""
     last_scan = time.monotonic()
 
+    def dispatch(msg, reply=None):
+        """swallow/cursor are handled here, everything else by the injector. reply(dict) or None for stdin."""
+        cmd = msg.get("cmd")
+        if cmd == "swallow":
+            if grab.enabled:
+                grab.set(str(msg.get("source", "")), msg.get("chords") or [])
+                grab.ensure(devs, meta)
+            return reply and reply({"ok": grab.enabled})
+        if cmd == "cursor":
+            threading.Thread(target=lambda: reply and reply(cursor_pos()), daemon=True).start()
+            return
+        r = inj.handle(msg)
+        return reply and reply(r)
+
     def lines(key, data):
         bufs[key] = bufs.get(key, b"") + data
         *done, bufs[key] = bufs[key].split(b"\n")
@@ -219,9 +414,13 @@ def main():
             except ValueError:
                 yield {}
 
+    if grab.enabled:
+        threading.Thread(target=grab.watchdog, daemon=True).start()
     try:
         while True:
+            grab.tick = time.monotonic()
             for k, _ in sel.select(timeout=1):
+                grab.tick = time.monotonic()
                 kind, path = k.data
                 if kind == "dev":
                     try:
@@ -232,6 +431,11 @@ def main():
                         drop(path)
                         continue
                     for e in parse_events(data):
+                        if path in grab.grabbed:  # replay (or swallow) BEFORE telling Electron: never block the keyboard on it
+                            try:
+                                grab.filter(path, e[0], e[1], e[2])
+                            except KeyError:
+                                pass
                         for ev in tr.translate(*e):
                             emit(ev)
                 elif kind == "srv":
@@ -248,10 +452,12 @@ def main():
                         sel.unregister(c); c.close(); bufs.pop(c, None)
                         continue
                     for msg in lines(c, data):
-                        try:
-                            c.sendall(json.dumps(inj.handle(msg)).encode() + b"\n")
-                        except OSError:
-                            pass
+                        def send(r, c=c):
+                            try:
+                                c.sendall(json.dumps(r).encode() + b"\n")
+                            except OSError:
+                                pass
+                        dispatch(msg, send)
                 else:  # stdin
                     try:
                         data = os.read(0, 4096)
@@ -260,10 +466,11 @@ def main():
                     if not data:
                         return  # parent died / closed us
                     for msg in lines(0, data):
-                        inj.handle(msg)
+                        dispatch(msg)
             if time.monotonic() - last_scan > 2:
                 last_scan = time.monotonic()
                 scan()
+                grab.ensure(devs, meta)
                 if inj.fd is None:
                     try:
                         inj.ensure()
@@ -272,6 +479,7 @@ def main():
     except BrokenPipeError:
         pass
     finally:
+        grab.release_all()
         try:
             os.unlink(SOCK_PATH)
         except OSError:

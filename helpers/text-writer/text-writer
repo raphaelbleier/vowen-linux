@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Linux text-writer for Vowen (clipboard paste helper).
   text-writer [--delay MS] [--char-delay MS] [--method clipboard|direct] [--no-restore] [--allow-history]
-              [--html HTML] [--snapshot PATH | --restore PATH | --set-clipboard] [--] [TEXT]
+              [--html HTML] [--chord ctrl+shift+v] [--snapshot PATH | --restore PATH | --set-clipboard] [--] [TEXT]
 Clipboard: wl-copy/wl-paste when WAYLAND_DISPLAY is set, else xclip, else xsel.
-Paste chord: vowen-input socket -> ydotool -> xdotool. Chord is Ctrl+V; set VOWEN_PASTE_CHORD=ctrl+shift+v (or
-shift+insert) for terminals. 'direct' is the same as 'clipboard' (layout/Unicode-safe); --html, --char-delay and
+Paste chord: vowen-input socket -> ydotool -> xdotool. Chord order: --chord, $VOWEN_PASTE_CHORD, else Ctrl+Shift+V
+when `vowen-activewin --get` says the focused window is a terminal, else Ctrl+V. 'direct' is the same as 'clipboard' (layout/Unicode-safe); --html, --char-delay and
 --allow-history are accepted and ignored (wl-copy/xclip offer one MIME type and cannot set transient hints)."""
-import argparse, json, os, shutil, socket, struct, subprocess, sys, time
+import argparse, json, os, re, shutil, socket, struct, subprocess, sys, time
 
 TEXT_MIMES = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"]
 SNAP_MIMES = TEXT_MIMES + ["text/html", "image/png", "image/jpeg"]  # restore prefers this order, one flavor only
@@ -105,13 +105,34 @@ class Clip:
         self.clear()
 
 
+TERMINALS = {"konsole", "yakuake", "kitty", "alacritty", "foot", "footclient", "wezterm", "terminal", "xterm", "uxterm",
+             "urxvt", "rxvt", "tilix", "terminator", "ghostty", "ptyxis", "console", "guake", "terminology", "kgx",
+             "qterminal", "lxterminal", "sakura", "st", "tabby", "hyper", "rio", "cool-retro-term"}
+
+
+def default_chord():
+    """Ctrl+Shift+V for terminals (focused window via vowen-activewin), else Ctrl+V. Never fails."""
+    here = os.path.dirname(os.path.realpath(__file__))
+    exe = os.path.join(here, "..", "vowen-activewin", "vowen-activewin")
+    cands = [os.path.join(here, "vowen-activewin"), exe, shutil.which("vowen-activewin")]
+    for c in cands:
+        if c and os.access(c, os.X_OK):
+            try:
+                rec = json.loads(subprocess.run([c, "--get"], capture_output=True, timeout=3, close_fds=True).stdout)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                return "ctrl+v"
+            toks = set(re.split(r"[._-]", f"{rec.get('bundleId', '')}.{rec.get('wmClass', '')}".lower()))
+            return "ctrl+shift+v" if toks & TERMINALS else "ctrl+v"
+    return "ctrl+v"
+
+
 def send_chord(chord):
     names = chord.lower().split("+")
     try:
         codes = [KEYS[n] for n in names]
     except KeyError:
         die(f"unknown key in VOWEN_PASTE_CHORD={chord!r}")
-    sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "vowen-input.sock")
+    sock = os.environ.get("VOWEN_INPUT_SOCK") or os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "vowen-input.sock")
     try:
         with socket.socket(socket.AF_UNIX) as s:
             s.settimeout(2)
@@ -140,6 +161,7 @@ def main():
     ap.add_argument("--no-restore", action="store_true")
     ap.add_argument("--allow-history", action="store_true")
     ap.add_argument("--html")
+    ap.add_argument("--chord")
     ap.add_argument("--snapshot")
     ap.add_argument("--restore")
     ap.add_argument("--set-clipboard", action="store_true")
@@ -174,7 +196,7 @@ def main():
         die("Failed to verify clipboard content was set")
     time.sleep(0.02)
     try:
-        send_chord(os.environ.get("VOWEN_PASTE_CHORD", "ctrl+v"))
+        send_chord(a.chord or os.environ.get("VOWEN_PASTE_CHORD") or default_chord())
         if saved is not None:
             time.sleep(0.3)  # target app reads the clipboard asynchronously after the chord
     finally:
