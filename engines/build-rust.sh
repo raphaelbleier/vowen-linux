@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build parakeet-cli + diarize-cli + sherpa-asr-cli (x86_64 linux) and fetch ONNX Runtime 1.24.2 into $OUT/{bin,lib}.
-#   BUILD_ROOT (default /mnt/linux-data/vowen-build)  OUT (default $BUILD_ROOT/resources)
+#   BUILD_ROOT (default ${XDG_CACHE_HOME:-$HOME/.cache}/vowen-linux/build)  OUT (default $BUILD_ROOT/resources)
 # Needs rustup/cargo (https://rustup.rs; user-local is fine) and cmake + a C++ compiler (sherpa-onnx-sys).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-BUILD_ROOT=${BUILD_ROOT:-/mnt/linux-data/vowen-build}
+BUILD_ROOT=${BUILD_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/vowen-linux/build}
 OUT=${OUT:-$BUILD_ROOT/resources}
 ORT_VER=1.24.2
 export PATH=$HOME/.cargo/bin:$PATH CARGO_TARGET_DIR=$BUILD_ROOT/cargo-target

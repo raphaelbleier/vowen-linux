@@ -3,10 +3,10 @@
 # (CPU variants always, CUDA / Vulkan when the toolchain is found) into $OUT/{bin,lib}.
 #
 # Env overrides:
-#   BUILD_ROOT  scratch + output root          (default /mnt/linux-data/vowen-build)
+#   BUILD_ROOT  scratch + output root          (default ${XDG_CACHE_HOME:-$HOME/.cache}/vowen-linux/build)
 #   SRC         whisper.cpp checkout           (default $BUILD_ROOT/whisper.cpp, cloned at v1.8.6)
 #   OUT         install root = app resources/  (default $BUILD_ROOT/resources)
-#   CUDA_HOME   CUDA toolkit                   (default /mnt/linux-data/cuda-13.0, then /usr/local/cuda)
+#   CUDA_HOME   CUDA toolkit                   (default /usr/local/cuda)
 #   CUDA_ARCHS  default "75;80;86;89;120"      (CUDA 13 dropped sm_61 = GTX 10xx; use the Vulkan backend there)
 #   WITH_CUDA / WITH_VULKAN  auto (default) | 0 | 1   (1 = fail if toolchain missing)
 #   CI=true     (set by GitHub) => no machine-specific RPATH entries
@@ -14,7 +14,7 @@
 #                                              no glslc => no Vulkan backend (Ubuntu: sudo apt install glslc)
 set -euo pipefail
 
-BUILD_ROOT=${BUILD_ROOT:-/mnt/linux-data/vowen-build}
+BUILD_ROOT=${BUILD_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/vowen-linux/build}
 SRC=${SRC:-$BUILD_ROOT/whisper.cpp}
 OUT=${OUT:-$BUILD_ROOT/resources}
 CUDA_ARCHS=${CUDA_ARCHS:-75;80;86;89;120}
@@ -32,7 +32,7 @@ RPATH='$ORIGIN/../lib:$ORIGIN'
 
 # CUDA (optional)
 WITH_CUDA=${WITH_CUDA:-auto}; WITH_VULKAN=${WITH_VULKAN:-auto}
-CUDA_HOME=${CUDA_HOME:-/mnt/linux-data/cuda-13.0}
+CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 [ -x "$CUDA_HOME/bin/nvcc" ] || CUDA_HOME=/usr/local/cuda
 [ "$WITH_CUDA" != 1 ] || [ -x "$CUDA_HOME/bin/nvcc" ] || { echo "WITH_CUDA=1 but no nvcc in $CUDA_HOME" >&2; exit 1; }
 if [ "$WITH_CUDA" != 0 ] && [ -x "$CUDA_HOME/bin/nvcc" ]; then

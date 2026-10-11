@@ -177,14 +177,18 @@ def main():
             elif c == "start-loopback":
                 if loop:
                     loop.stop()
-                try:
-                    sink = pactl("get-default-sink").strip()
-                    assert sink
-                except Exception:
-                    event(type="loopback-error", message="no default audio sink")
-                    sys.exit(1)
+                # VOWEN_LOOPBACK_SOURCE overrides the captured source (tests use a null sink's monitor).
+                src = os.environ.get("VOWEN_LOOPBACK_SOURCE")
+                if not src:
+                    try:
+                        sink = pactl("get-default-sink").strip()
+                        assert sink
+                    except Exception:
+                        event(type="loopback-error", message="no default audio sink")
+                        sys.exit(1)
+                    src = sink + ".monitor"
                 event(type="audio-config", output_sample_rate=LOOP_RATE, channels=1)
-                loop = Capture([sink + ".monitor"], LOOP_RATE, 40, LOOP_RATE * 2 // 25, loopback=True)  # 40 ms frames
+                loop = Capture([src], LOOP_RATE, 40, LOOP_RATE * 2 // 25, loopback=True)  # 40 ms frames
                 loop.start()
             elif c == "stop-loopback":
                 if loop:

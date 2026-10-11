@@ -4,15 +4,15 @@
 #   base: vowen-engines-linux-x64.tar.gz       bin/ whisper-* ggml-cpu-*.so ggml-vulkan.so *-cli, lib/ libwhisper libggml* libonnxruntime
 #   cuda: vowen-engines-cuda-linux-x64.tar.gz  bin/libggml-cuda.so, lib/ libcudart libcublas libcublasLt (from $CUDA_HOME)
 # Both extract into the app's resources/.
-#   BUILD_ROOT (default /mnt/linux-data/vowen-build)  OUT (default $BUILD_ROOT/resources)  DEST (default $PWD)
+#   BUILD_ROOT (default ${XDG_CACHE_HOME:-$HOME/.cache}/vowen-linux/build)  OUT (default $BUILD_ROOT/resources)  DEST (default $PWD)
 #   SKIP_BUILD=1 packs an existing $OUT instead of running build-whisper.sh + build-rust.sh first.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 MODE=${1:-all}
-export BUILD_ROOT=${BUILD_ROOT:-/mnt/linux-data/vowen-build}
+export BUILD_ROOT=${BUILD_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/vowen-linux/build}
 export OUT=${OUT:-$BUILD_ROOT/resources}
 DEST=$(mkdir -p "${DEST:-$PWD}" && cd "${DEST:-$PWD}" && pwd)
-CUDA_HOME=${CUDA_HOME:-/mnt/linux-data/cuda-13.0}
+CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 [ -x "$CUDA_HOME/bin/nvcc" ] || CUDA_HOME=/usr/local/cuda
 if [ -z "${SKIP_BUILD:-}" ]; then "$HERE/build-whisper.sh"; "$HERE/build-rust.sh"; fi
 
