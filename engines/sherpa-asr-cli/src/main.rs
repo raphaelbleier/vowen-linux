@@ -68,7 +68,7 @@ fn run() -> Result<()> {
         s.set_option("language", l);
     }
     s.accept_waveform(16000, &samples);
-    s.accept_waveform(16000, &vec![0f32; 16000]); // tail so the last 1120 ms chunk fills
+    s.accept_waveform(16000, &vec![0f32; 48000]); // 3 s tail: the last 1120 ms chunk plus lookahead must fill, or trailing words are dropped
     s.input_finished();
     while rec.is_ready(&s) {
         rec.decode(&s);
