@@ -1,0 +1,46 @@
+vowen-linux third-party notices
+================================
+
+This repository contains no Vowen code. Everything below is either built from source by this project's
+engine workflows, fetched at install time from its upstream, or downloaded by the app on first use.
+Licenses were checked against the upstream repositories / model cards (HuggingFace, GitHub, crates.io, npm).
+
+1. Software redistributed in the engines release (built by .github/workflows/engines.yml)
+---------------------------------------------------------------------------------------
+whisper.cpp / ggml            MIT         https://github.com/ggml-org/whisper.cpp
+ONNX Runtime                  MIT         https://github.com/microsoft/onnxruntime   (shared library used by parakeet-cli)
+sherpa-onnx                   Apache-2.0  https://github.com/k2-fsa/sherpa-onnx      (linked into diarize-cli and sherpa-asr-cli)
+transcribe-rs                 MIT         https://github.com/cjpais/transcribe-rs    (parakeet-cli)
+ort (Rust bindings)           MIT OR Apache-2.0
+Rust crates (clap, serde_json, hound, anyhow, ...) under MIT / Apache-2.0; see engines/*/Cargo.lock
+CUDA add-on                   NVIDIA CUDA Toolkit redistributable runtime (cudart, cublas) under the
+                              NVIDIA CUDA Toolkit EULA, attachment A. Only shipped in the optional CUDA tarball.
+
+2. Software fetched by install.sh
+---------------------------------
+Electron 38                   MIT; bundles Chromium and other components, see LICENSES.chromium.html in the install dir
+sqlite3 (npm)                 BSD-3-Clause
+sharp (npm)                   Apache-2.0; bundles libvips (@img/sharp-libvips-*) under LGPL-3.0-or-later
+@ffmpeg-installer/linux-x64   GPL-3.0 (static ffmpeg build, run as a separate process)
+native-keymap (npm, optional) MIT
+uiohook-napi                  MIT. Not used on Linux: shims/uiohook-napi is an original replacement written for this
+                              project that reads evdev through helpers/vowen-input.
+Vowen itself                  Proprietary, downloaded from vowen.ai by the user's machine; not redistributed here.
+
+3. Speech models (downloaded by the Vowen app on demand, never bundled in this repository)
+-------------------------------------------------------------------------------------------
+Whisper models (ggml-*.bin)   MIT (OpenAI Whisper; ggml conversion by ggerganov/whisper.cpp)
+Silero VAD (ggml-silero-*)    MIT (supplied inside the official Vowen download)
+NVIDIA Parakeet TDT 0.6B v2/v3, Parakeet TDT-CTC 0.6B JA (ONNX conversions by istupakov, visuall)
+                              CC-BY-4.0 - credit NVIDIA, https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3 (and -v2, -ja)
+NVIDIA Nemotron Speech Streaming EN 0.6B (ONNX int8 by csukuangfj)
+                              NVIDIA Open Model License
+                              https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-open-model-license/
+NVIDIA Nemotron 3.5 ASR Streaming 0.6B (multilingual, ONNX int8 by csukuangfj)
+                              OpenMDW License 1.1  https://openmdw.ai/license/1-1/
+pyannote segmentation-3.0     MIT
+WeSpeaker ResNet34 (pyannote/wespeaker-voxceleb-resnet34-LM) and pyannote community-1 PLDA parameters
+                              CC-BY-4.0
+                              (these two ship in Vowen's own diarizer archive; the app downloads them from Vowen)
+
+Model licenses can change; the model cards linked from each download are authoritative.

@@ -21,7 +21,7 @@ cd vowen-linux
 ./install.sh
 ```
 
-The installer puts Vowen in `~/.local/share/vowen-linux`, the launcher in `~/.local/bin/vowen`, and adds a menu entry and the `vowen://` link handler. Re-run it to update.
+The installer puts Vowen in `~/.local/share/vowen-linux`, the launcher in `~/.local/bin/vowen-linux`, and adds a menu entry and the `vowen://` link handler. Re-run it to update.
 
 One-time permissions (the installer prints these when needed):
 
@@ -44,6 +44,13 @@ Members of the `input` group can read keyboard input; that is what a global push
 | Parakeet v2/v3, speaker diarization | ONNX Runtime / sherpa-onnx builds of the Windows engines |
 | Pause media while dictating | `playback-controller`: MPRIS + `wpctl` |
 | Autostart, tray | XDG autostart, StatusNotifierItem |
+| Screenshots (region capture, click capture, meeting screenshots, colour palette) | `vowen-screenshot`: spectacle (KDE), grim, gnome-screenshot or ImageMagick `import`, cropped per monitor |
+| Command-mode file actions | Ctrl+C in the file manager, reads `text/uri-list` from the clipboard, then restores it |
+| Open with / links | audio and video files in "Open with Vowen", `vowen://` links also on first launch |
+| Stop recording on lock / suspend | KDE and GNOME `ScreenSaver` D-Bus signal, logind suspend |
+| Cloud sync folders | Dropbox (`~/.dropbox/info.json`), Google Drive and OneDrive (home folders, Insync, rclone mounts) |
+
+Start Vowen from the menu or with `vowen-linux`. The launcher is deliberately not called `vowen`: Vowen's Developer settings look for its own `vowen` command-line tool on `PATH`. It also picks the key store (`--password-store`: KWallet on KDE, libsecret on GNOME and others) and adds your login shell's `PATH`, so CLI agents such as Claude Code or Codex in `~/.local/bin` or npm-global are found.
 
 Terminals paste with Ctrl+Shift+V: set `VOWEN_PASTE_CHORD=ctrl+shift+v` if you mostly dictate into a terminal.
 
@@ -66,6 +73,10 @@ engines/              build scripts for whisper.cpp, parakeet-cli, diarize-cli
 packaging/            desktop integration, AppArmor profile, udev rule
 tests/                helper protocol tests
 ```
+
+## Third-party licenses
+
+See [NOTICE](NOTICE) for the engines, npm packages and speech models (Parakeet is CC-BY-4.0, Nemotron EN is under the NVIDIA Open Model License).
 
 ## License
 

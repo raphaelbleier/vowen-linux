@@ -1,0 +1,33 @@
+#!/usr/bin/env python3
+"""Captures the whole desktop (all monitors, no pointer) to a PNG: vowen-screenshot OUT.png
+Backends, first that works: spectacle (KDE), grim (wlroots), gnome-screenshot, import (X11), scrot.
+Exit 0 on success, 1 on capture failure, 2 if no backend is installed. Cropping per display is done by the caller."""
+import os, shutil, subprocess, sys
+
+out = sys.argv[1] if len(sys.argv) > 1 else sys.exit("usage: vowen-screenshot OUT.png")
+x11_only = not os.environ.get("WAYLAND_DISPLAY")
+backends = [
+    ("spectacle", ["spectacle", "-b", "-n", "-f", "-o", out]),
+    ("grim", ["grim", out]),
+    ("gnome-screenshot", ["gnome-screenshot", "-f", out]),
+]
+if x11_only or os.environ.get("DISPLAY"):
+    backends += [("import", ["import", "-window", "root", out]), ("scrot", ["scrot", "-o", out])]
+
+found = False
+for name, cmd in backends:
+    if not shutil.which(name):
+        continue
+    found = True
+    try:
+        os.unlink(out)
+    except FileNotFoundError:
+        pass
+    try:
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=10, close_fds=True)
+    except subprocess.TimeoutExpired:
+        continue
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        sys.exit(0)
+sys.exit(1 if found else 2)

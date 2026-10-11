@@ -8,15 +8,11 @@ APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 ICONS="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/512x512/apps"
 mkdir -p "$BIN" "$APPS" "$ICONS"
 
-cat > "$BIN/vowen" <<LAUNCHER
-#!/bin/sh
-# XWayland: Electron's native Wayland backend crashes Vowen and can't place its overlays.
-export VOWEN_LAUNCHER="$BIN/vowen" CHROME_DESKTOP=vowen.desktop
-SANDBOX=--no-sandbox
-[ -f /etc/apparmor.d/vowen-linux ] || [ "\$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" != 1 ] && SANDBOX=
-exec "$DIR/vowen" --ozone-platform=x11 \$SANDBOX "\$@"
-LAUNCHER
-chmod +x "$BIN/vowen"
+# Named vowen-linux: Vowen's Developer settings probe for a `vowen` CLI on PATH and would run our launcher as it.
+sed "s|@DIR@|$DIR|" "$(dirname "$0")/vowen-linux.sh" > "$BIN/vowen-linux"
+chmod +x "$BIN/vowen-linux"
+# Earlier versions installed the launcher as ~/.local/bin/vowen
+if grep -q VOWEN_LAUNCHER "$BIN/vowen" 2>/dev/null; then rm -f "$BIN/vowen"; fi
 
 python3 -I - "$DIR/resources/assets/icon.png" "$ICONS/vowen.png" <<'PY' 2>/dev/null || cp "$DIR/resources/assets/icon.png" "$ICONS/vowen.png"
 import sys
@@ -29,11 +25,11 @@ cat > "$APPS/vowen.desktop" <<DESKTOP
 Type=Application
 Name=Vowen
 Comment=Voice dictation and meeting notes (unofficial Linux build)
-Exec="$BIN/vowen" %U
+Exec="$BIN/vowen-linux" %U
 Icon=vowen
 Terminal=false
 Categories=Utility;Accessibility;
-MimeType=x-scheme-handler/vowen;
+MimeType=x-scheme-handler/vowen;audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;audio/ogg;audio/opus;audio/flac;audio/x-flac;audio/wav;audio/x-wav;audio/webm;audio/x-ms-wma;video/mp4;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;video/mpeg;video/x-flv;video/x-ms-wmv;
 StartupWMClass=vowen
 DESKTOP
 update-desktop-database "$APPS" 2>/dev/null || true

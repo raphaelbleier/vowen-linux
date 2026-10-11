@@ -108,4 +108,4 @@ rm -rf "${PREFIX:?}"
 mv "$PREFIX.new" "$PREFIX"
 "$HERE/packaging/integrate.sh" "$PREFIX"
 
-say "Done. Start Vowen from your app menu or run: vowen"
+say "Done. Start Vowen from your app menu or run: vowen-linux"
