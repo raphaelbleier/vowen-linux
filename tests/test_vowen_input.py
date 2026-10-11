@@ -38,8 +38,10 @@ with tempfile.TemporaryDirectory() as d:
                          env={**os.environ, "XDG_RUNTIME_DIR": d})
     path = os.path.join(d, "vowen-input.sock")
     for _ in range(50):
-        if os.path.exists(path): break
+        if os.path.exists(path) or p.poll() is not None: break
         time.sleep(0.1)
+    if p.poll() == 13:  # neither /dev/input nor /dev/uinput usable (CI): helper refuses to run, by design
+        print("SKIP process part: no input device access"); sys.exit(0)
     c = socket.socket(socket.AF_UNIX); c.connect(path); f = c.makefile("rwb")
     f.write(b'{"cmd":"ping"}\n'); f.flush()
     assert json.loads(f.readline()) == {"ok": True}
