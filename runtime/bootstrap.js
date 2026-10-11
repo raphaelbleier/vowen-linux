@@ -49,4 +49,12 @@ app.on('browser-window-created', (_e, win) => {
   }, 100));
 });
 
+// Logout/shutdown sends SIGTERM; Vowen's windows veto plain closes, so go through its quit path.
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  process.on(sig, () => {
+    app.quit();
+    setTimeout(() => app.exit(0), 5000).unref();
+  });
+}
+
 require('../dist-electron/main.bundle.js');

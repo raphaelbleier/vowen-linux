@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """text-writer clipboard round trips. Saves and restores the user's clipboard; sends no keystrokes."""
-import os, subprocess, sys, tempfile
+import os, shutil, subprocess, sys, tempfile
+
+if not (shutil.which("wl-paste") and shutil.which("wl-copy") and os.environ.get("WAYLAND_DISPLAY") and os.environ.get("XDG_RUNTIME_DIR")):
+    print("SKIP: no Wayland session with wl-clipboard"); sys.exit(0)
 
 TW = os.path.join(os.path.dirname(__file__), "../helpers/text-writer/text-writer")
 ST = os.path.join(os.path.dirname(__file__), "../helpers/selected-text/selected-text")

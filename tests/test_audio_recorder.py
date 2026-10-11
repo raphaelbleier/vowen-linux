@@ -2,6 +2,10 @@
 """Protocol test for audio-recorder: list-devices, mic start/stop, loopback. Records ~2 s each."""
 import json, os, struct, subprocess, sys, threading, time
 
+import shutil
+if not shutil.which("parec") or not shutil.which("pactl") or subprocess.run(["pactl", "info"], capture_output=True).returncode != 0:
+    print("SKIP: no PulseAudio/PipeWire (pactl/parec)"); sys.exit(0)
+
 BIN = os.path.join(os.path.dirname(__file__), "../helpers/audio-recorder/audio-recorder")
 
 

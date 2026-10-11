@@ -1,0 +1,82 @@
+name: engines
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish to (e.g. engines-v1). Empty = build only, keep as workflow artifacts.
+        required: false
+  push:
+    tags: ['engines-v*']
+permissions:
+  contents: read
+env:
+  BUILD_ROOT: ${{ github.workspace }}/../vowen-build
+  CUDA_VER: '12-9'   # CUDA 12.9: sm_61 (GTX 10xx) through sm_120 (Blackwell); 13.x dropped sm_61
+jobs:
+  base:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build glslc libvulkan-dev spirv-headers pkg-config
+      - name: whisper.cpp (CPU variants + Vulkan)
+        run: WITH_CUDA=0 WITH_VULKAN=1 engines/build-whisper.sh
+      - name: Rust CLIs + ONNX Runtime
+        run: engines/build-rust.sh
+      - name: Package
+        run: SKIP_BUILD=1 DEST="$PWD/dist" engines/package-engines.sh base
+      - name: Smoke test (no LD_LIBRARY_PATH)
+        run: |
+          mkdir smoke && tar -xzf dist/vowen-engines-linux-x64.tar.gz -C smoke
+          ! ldd smoke/bin/whisper-server | grep 'not found'
+          smoke/bin/whisper-cli --help >/dev/null
+      - uses: actions/upload-artifact@v4
+        with: { name: engines-base, path: dist/*, if-no-files-found: error }
+  cuda:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+      - name: Dependencies + CUDA toolkit (NVIDIA apt repo)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config
+          curl -fsSLO https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y "cuda-nvcc-$CUDA_VER" "cuda-cudart-dev-$CUDA_VER" "libcublas-dev-$CUDA_VER"
+      - name: whisper.cpp CUDA backend
+        env:
+          CUDA_HOME: /usr/local/cuda-12.9
+          CUDA_ARCHS: '61;75;80;86;89;120'
+        run: WITH_CUDA=1 WITH_VULKAN=0 engines/build-whisper.sh
+      - name: Package
+        env:
+          CUDA_HOME: /usr/local/cuda-12.9
+        run: SKIP_BUILD=1 DEST="$PWD/dist" engines/package-engines.sh cuda
+      - uses: actions/upload-artifact@v4
+        with: { name: engines-cuda, path: dist/*, if-no-files-found: error }
+  release:
+    needs: [base, cuda]
+    if: github.event_name == 'push' || inputs.tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Verify and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: |
+          cd dist && sha256sum -c ./*.sha256
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" \
+            --notes "Prebuilt Linux x64 engines (whisper.cpp v1.8.6, Parakeet, diarization, sherpa-onnx). Used by install.sh."
+          gh release upload "$TAG" --clobber ./*

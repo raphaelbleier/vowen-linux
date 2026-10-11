@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """parec mic capture must give MIC_START/MIC_STOP <pid>, unless it descends from --exclude-pid."""
-import os, subprocess, time
+import os, subprocess, sys, time
+
+import shutil
+if not shutil.which("parec") or not shutil.which("pactl") or subprocess.run(["pactl", "info"], capture_output=True).returncode != 0:
+    print("SKIP: no PulseAudio/PipeWire (pactl/parec)"); sys.exit(0)
 
 BIN = os.path.join(os.path.dirname(__file__), "../helpers/linux-mic-listener/linux-mic-listener")
 

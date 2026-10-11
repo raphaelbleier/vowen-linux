@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  shellcheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -x -S warning install.sh scripts/*.sh engines/*.sh packaging/*.sh
+  tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: python helper tests (device-bound ones skip themselves)
+        run: for t in tests/test_*.py; do echo "== $t"; python3 "$t"; done
+      - name: node shim test
+        run: node tests/test_shim.js
+  patches:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: 7z
+        run: command -v 7z || sudo apt-get install -y p7zip-full
+      # Downloads the pinned DMG from vowen.ai into a runner-local cache dir; it is never uploaded or cached as an artifact.
+      - run: scripts/verify-patches.sh "$RUNNER_TEMP/vowen-cache"

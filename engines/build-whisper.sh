@@ -8,6 +8,8 @@
 #   OUT         install root = app resources/  (default $BUILD_ROOT/resources)
 #   CUDA_HOME   CUDA toolkit                   (default /mnt/linux-data/cuda-13.0, then /usr/local/cuda)
 #   CUDA_ARCHS  default "75;80;86;89;120"      (CUDA 13 dropped sm_61 = GTX 10xx; use the Vulkan backend there)
+#   WITH_CUDA / WITH_VULKAN  auto (default) | 0 | 1   (1 = fail if toolchain missing)
+#   CI=true     (set by GitHub) => no machine-specific RPATH entries
 #   GLSLC       path to glslc for Vulkan       (default: glslc in PATH or $BUILD_ROOT/tools/vulkan-sdk/*/x86_64/bin)
 #                                              no glslc => no Vulkan backend (Ubuntu: sudo apt install glslc)
 set -euo pipefail
@@ -29,9 +31,11 @@ args=(-G Ninja -B "$BUILD" -S "$SRC" -DCMAKE_BUILD_TYPE=Release
 RPATH='$ORIGIN/../lib:$ORIGIN'
 
 # CUDA (optional)
+WITH_CUDA=${WITH_CUDA:-auto}; WITH_VULKAN=${WITH_VULKAN:-auto}
 CUDA_HOME=${CUDA_HOME:-/mnt/linux-data/cuda-13.0}
 [ -x "$CUDA_HOME/bin/nvcc" ] || CUDA_HOME=/usr/local/cuda
-if [ -x "$CUDA_HOME/bin/nvcc" ]; then
+[ "$WITH_CUDA" != 1 ] || [ -x "$CUDA_HOME/bin/nvcc" ] || { echo "WITH_CUDA=1 but no nvcc in $CUDA_HOME" >&2; exit 1; }
+if [ "$WITH_CUDA" != 0 ] && [ -x "$CUDA_HOME/bin/nvcc" ]; then
   export PATH=$CUDA_HOME/bin:$PATH
   # glibc >= 2.41 declares rsqrt/rsqrtf noexcept, CUDA 13.0's math_functions.h does not -> nvcc errors out.
   # Known upstream fix: add the exception spec to the toolkit header (idempotent, backup kept).
@@ -40,14 +44,15 @@ if [ -x "$CUDA_HOME/bin/nvcc" ]; then
     cp -n "$H" "$H.orig"; sed -i -E 's/(rsqrtf?\((double|float) x\));/\1 noexcept(true);/' "$H"
   fi
   # nvcc 13.0 accepts gcc 15; if your host gcc is newer, set CUDAHOSTCXX=g++-NN or add -allow-unsupported-compiler
-  RPATH+=":$CUDA_HOME/lib64:/usr/local/cuda/lib64"
+  [ -n "${CI:-}" ] || RPATH+=":$CUDA_HOME/lib64:/usr/local/cuda/lib64"
   args+=(-DGGML_CUDA=ON "-DCMAKE_CUDA_ARCHITECTURES=$CUDA_ARCHS" "-DCMAKE_CUDA_COMPILER=$CUDA_HOME/bin/nvcc")
   [ -z "${CUDAHOSTCXX:-}" ] || args+=("-DCMAKE_CUDA_HOST_COMPILER=$CUDAHOSTCXX")
 else echo "no CUDA toolkit found: building without CUDA backend"; fi
 
 # Vulkan (optional, needs glslc + libvulkan-dev)
 GLSLC=${GLSLC:-$(command -v glslc || ls "$BUILD_ROOT"/tools/vulkan-sdk/*/x86_64/bin/glslc 2>/dev/null | head -1 || true)}
-if [ -n "$GLSLC" ] && [ -f /usr/include/vulkan/vulkan.h ]; then
+[ "$WITH_VULKAN" != 1 ] || { [ -n "$GLSLC" ] && [ -f /usr/include/vulkan/vulkan.h ]; } || { echo "WITH_VULKAN=1 but glslc/libvulkan-dev missing" >&2; exit 1; }
+if [ "$WITH_VULKAN" != 0 ] && [ -n "$GLSLC" ] && [ -f /usr/include/vulkan/vulkan.h ]; then
   # ggml-vulkan needs SPIRV-Headers' cmake config (apt: spirv-headers); fetch + install user-locally if absent
   SPV=$BUILD_ROOT/tools/spirv-headers
   if ! ls /usr/share/cmake*/SPIRV-Headers* /usr/lib/cmake/SPIRV-Headers* >/dev/null 2>&1 && [ ! -d "$SPV" ]; then

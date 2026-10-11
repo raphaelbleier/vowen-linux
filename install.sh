@@ -3,34 +3,31 @@
 # Nothing from Vowen is redistributed: the DMG is downloaded from vowen.ai on your machine,
 # deobfuscated, patched for Linux and assembled with Linux Electron + Linux helpers.
 #
-# usage: ./install.sh [--prefix DIR] [--engines DIR|URL] [--keep-work]
+# usage: ./install.sh [--prefix DIR] [--engines DIR|URL] [--cuda|--no-cuda] [--keep-work]
+#   --engines overrides the base engines tarball (URL, with a sibling .sha256) or an unpacked resources dir.
+#   CUDA add-on: auto when nvidia-smi works; --cuda forces it, --no-cuda skips it.
 set -euo pipefail
 
-VOWEN_VERSION=0.5.10
-DMG_URL="https://assets.vowen.ai/Vowen-${VOWEN_VERSION}-arm64.dmg"
-DMG_SHA256=461f90a0d9093c011ee221a492d88038cd09684e5be2f5ef527a89eba6caf10d
-ELECTRON_VERSION=38.7.2
-ELECTRON_SHA256=fe428cd212680e1d6df61fa67efc260b9221d089c7a14c9863f18bcbeace5628
-WEBCRACK_VERSION=2.16.0
-ASAR_VERSION=3.4.1
-ENGINES_URL="https://github.com/raphaelbleier/vowen-linux/releases/download/engines-v1/vowen-engines-linux-x64.tar.gz"
-
 HERE=$(cd "$(dirname "$0")" && pwd)
+# shellcheck source=versions.env
+. "$HERE/versions.env"
+# shellcheck source=scripts/common.sh
+. "$HERE/scripts/common.sh"
 PREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/vowen-linux"
-ENGINES="$ENGINES_URL"
+ENGINES="$ENGINES_URL_BASE/vowen-engines-linux-x64.tar.gz"
+CUDA=auto
 KEEP_WORK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix) PREFIX=$2; shift ;;
     --engines) ENGINES=$2; shift ;;
+    --cuda) CUDA=1 ;;
+    --no-cuda) CUDA=0 ;;
     --keep-work) KEEP_WORK=1 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
-
-say() { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
-die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
 for cmd in curl 7z node npm npx python3 unzip; do
   command -v "$cmd" >/dev/null || die "missing dependency: $cmd"
@@ -42,36 +39,12 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/vowen-linux.XXXXXX")
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/vowen-linux"
 mkdir -p "$CACHE"
 
-fetch() { # url sha256 dest
-  if [ ! -f "$3" ] || ! echo "$2  $3" | sha256sum -c --status; then
-    say "Downloading $(basename "$3")"
-    curl -fL --progress-bar -o "$3.part" "$1"
-    mv "$3.part" "$3"
-  fi
-  echo "$2  $3" | sha256sum -c --status || die "checksum mismatch: $3"
-}
-
-fetch "$DMG_URL" "$DMG_SHA256" "$CACHE/Vowen-$VOWEN_VERSION.dmg"
 fetch "https://github.com/electron/electron/releases/download/v$ELECTRON_VERSION/electron-v$ELECTRON_VERSION-linux-x64.zip" \
   "$ELECTRON_SHA256" "$CACHE/electron-v$ELECTRON_VERSION-linux-x64.zip"
 
-say "Extracting Vowen $VOWEN_VERSION"
-7z x -y -o"$WORK/dmg" "$CACHE/Vowen-$VOWEN_VERSION.dmg" 'Vowen.app/Contents/Resources/*' >/dev/null
-MAC="$WORK/dmg/Vowen.app/Contents/Resources"
-find "$MAC" -name '*:com.apple.*' -delete
+"$HERE/scripts/prepare-app.sh" "$WORK" "$CACHE"
 APP="$WORK/app"
-npx -y "@electron/asar@$ASAR_VERSION" extract "$MAC/app.asar" "$APP"
-
-say "Deobfuscating (webcrack $WEBCRACK_VERSION, this takes a minute)"
-npm install --prefix "$WORK/tools" --silent --no-audit --no-fund "webcrack@$WEBCRACK_VERSION" >/dev/null
-for f in "$APP"/dist-electron/*.js "$APP"/dist-react/*.js; do
-  [ "$(basename "$f")" = vendor-modules.js ] && continue
-  NODE_OPTIONS=--max-old-space-size=8192 "$WORK/tools/node_modules/.bin/webcrack" --no-jsx --no-unpack "$f" > "$f.deob" 2>/dev/null
-  mv "$f.deob" "$f"
-done
-
-say "Applying Linux patches"
-node "$HERE/patches/apply.mjs" "$APP" | grep -v '^ok' || true
+MAC="$WORK/dmg/Vowen.app/Contents/Resources"
 mkdir -p "$APP/linux"
 cp "$HERE"/runtime/* "$APP/linux/"
 node -e 'const f=process.argv[1],p=require(f);p.main="linux/bootstrap.js";require("fs").writeFileSync(f,JSON.stringify(p,null,2))' "$APP/package.json"
@@ -109,10 +82,24 @@ cp -a "$MAC/assets" "$MAC/models" "$MAC/warmup.wav" "$DEST/resources/"
 say "Installing helpers and engines"
 mkdir -p "$DEST/resources/bin" "$DEST/resources/lib"
 find "$HERE/helpers" -mindepth 2 -maxdepth 2 -type f -perm -u+x -exec cp {} "$DEST/resources/bin/" \;
+want_cuda=$CUDA
+[ "$CUDA" != auto ] || { nvidia-smi -L >/dev/null 2>&1 && want_cuda=1 || want_cuda=0; }
+unpack() { # tarball URL (verified against URL.sha256) -> resources
+  local f; f="$WORK/$(basename "$1")"
+  curl -fL --progress-bar -o "$f" "$1"
+  curl -fsSL -o "$f.sha256" "$1.sha256" || die "missing checksum: $1.sha256"
+  (cd "$WORK" && sha256sum -c --status "$(basename "$f").sha256") || die "checksum mismatch: $1"
+  tar -xzf "$f" -C "$DEST/resources"
+}
 case "$ENGINES" in
-  http*://*) curl -fL --progress-bar "$ENGINES" | tar -xz -C "$DEST/resources" ;;
+  http*://*) unpack "$ENGINES" ;;
   *) [ -d "$ENGINES" ] || die "engines dir not found: $ENGINES"; cp -a "$ENGINES/." "$DEST/resources/" ;;
 esac
+if [ "$want_cuda" = 1 ]; then
+  say "Installing CUDA add-on"
+  unpack "$ENGINES_URL_BASE/vowen-engines-cuda-linux-x64.tar.gz"
+fi
+"$HERE/packaging/wrap-daemons.sh" "$DEST/resources"
 
 say "Installing to $PREFIX"
 rm -rf "${PREFIX:?}.new"
