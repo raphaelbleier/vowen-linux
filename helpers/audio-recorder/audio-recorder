@@ -7,7 +7,6 @@ OUT_LOCK = threading.Lock()
 MIC_RATE, LOOP_RATE = 16000, 48000
 CHUNK = 1600          # bytes per mic frame = 800 samples = 50 ms @16k
 STALL_MS = 2000       # no data for this long -> mic-stall
-LOOP_SILENT_S = 10
 
 
 def log(*a):
@@ -69,9 +68,8 @@ class Capture(threading.Thread):
         return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
 
     def run(self):
-        buf, idx, stalled, unrec, zero_since, stall_t0 = b"", 0, False, False, None, 0
+        buf, idx, stalled, unrec, stall_t0 = b"", 0, False, False, 0
         last, fails = time.monotonic(), 0
-        silent_sent = False
         try:
             self.proc = self.spawn(self.chain[idx])
         except OSError as e:
@@ -88,14 +86,9 @@ class Capture(threading.Thread):
                 while len(buf) >= self.chunk:
                     pcm, buf = buf[:self.chunk], buf[self.chunk:]
                     frame(2, pcm)
-                    if self.loopback and not silent_sent:
-                        if any(pcm):
-                            zero_since = None
-                        else:
-                            zero_since = zero_since or time.monotonic()
-                            if time.monotonic() - zero_since > LOOP_SILENT_S:
-                                silent_sent = True
-                                event(type="loopback-silent", message="no audio on system output")
+                    # No "loopback-silent": Vowen treats it as a broken capture and switches to
+                    # getDisplayMedia. A PipeWire monitor that delivers frames is never broken;
+                    # silence just means nothing is playing (common at the start of a meeting).
                 continue
             gap = (time.monotonic() - last) * 1000
             if data == b"" or self.proc.poll() is not None or gap > STALL_MS:
