@@ -74,7 +74,7 @@ fn run() -> Result<()> {
         rec.decode(&s);
     }
     let r = rec.get_result(&s).ok_or_else(|| anyhow!("no result"))?;
-    let text = r.text.trim().to_string();
+    let text = r.text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = json!({ "text": text });
     if a.timestamps {
         let dur = samples.len() as f32 / 16000.0;
