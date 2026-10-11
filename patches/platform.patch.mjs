@@ -63,4 +63,21 @@ export default [
         }
         const W = j === "win32" ? "playback-controller.exe" : "playback-controller";`,
   },
+  {
+    // "Pause media while dictating": Linux's playback-controller speaks the Windows protocol (pause/resume/mute/unmute).
+    id: 'media-suppress-linux',
+    file: MAIN,
+    find: `if (L.platform() === "win32") {
+                  return await O.suppress(E);`,
+    replace: `if (L.platform() === "win32" || L.platform() === "linux") {
+                  return await O.suppress(E);`,
+  },
+  {
+    id: 'media-restore-linux',
+    file: MAIN,
+    find: `if (L.platform() === "win32") {
+                const V = await O.restore();`,
+    replace: `if (L.platform() === "win32" || L.platform() === "linux") {
+                const V = await O.restore();`,
+  },
 ];
