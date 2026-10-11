@@ -42,28 +42,30 @@ means built and unit-tested but not yet driven through the app.
 | Push-to-talk hotkey (hold Ctrl+Shift) | `vowen-input`: evdev reader + uinput keyboard, works on Wayland and X11 | tested |
 | Microphone recording | `audio-recorder`: PipeWire/Pulse via `parec` | tested |
 | Text insertion | `text-writer`: clipboard + Ctrl+V through `vowen-input` (fallback `ydotool`, `xdotool`) | tested |
-| Paste into terminals (Ctrl+Shift+V) | active window from a KWin script (`vowen-activewin`) | implemented |
-| Whisper models | whisper.cpp 1.8.6, CPU / Vulkan / CUDA backends loaded at runtime | tested (base, CUDA) |
+| Paste into terminals (Ctrl+Shift+V) | active window from a KWin script (`vowen-activewin`) | tested (Konsole) |
+| Whisper models | whisper.cpp 1.8.6, CPU / Vulkan / CUDA backends loaded at runtime | tested (tiny, base, small, large-v3-turbo; CUDA and Vulkan) |
 | Parakeet v3, v2, Japanese | ONNX Runtime (`parakeet-cli`) | tested |
 | Nemotron EN | sherpa-onnx (`sherpa-asr-cli`) | tested (no punctuation) |
-| Nemotron multilingual | sherpa-onnx | implemented |
+| Nemotron multilingual | sherpa-onnx | tested |
 | Parakeet Mandarin | no ONNX export exists | not available (use Nemotron multilingual) |
 | Model download / selection | Vowen's own model manager | tested |
 | Tray menu | StatusNotifierItem + DBusMenu | tested |
 | Settings / onboarding windows | XWayland | tested |
 | Quit, logout, crash cleanup | SIGTERM handling, engine servers die with the app | tested |
 | Usage statistics | Vowen's JSON store | tested |
-| Meeting notes with system audio | default sink monitor via `parec` | implemented |
-| Speaker diarization | sherpa-onnx (`diarize-cli`) | implemented |
-| Meeting detection (mic in use) | `linux-mic-listener`: `pactl subscribe` | implemented |
-| Hands-free mode, command mode, voice shortcuts, expansions, dictionary | Vowen's own logic | implemented, testing in progress |
+| Meeting notes with system audio | default sink monitor via `parec` | tested (mic + system audio, start/stop from the tray) |
+| Speaker diarization | sherpa-onnx (`diarize-cli`) | engine tested; in notes it is a Pro feature, not tested |
+| Meeting detection (mic in use) | `linux-mic-listener`: `pactl subscribe` | helper tested; Pro feature, not tested in the app |
+| Hands-free mode, voice shortcuts, text expansions | Vowen's own logic on top of `vowen-input` | tested |
+| Command mode, AI cleanup | needs an AI provider (API key or local LLM) | not tested |
+| Dictionary | Vowen's own logic | not tested separately |
 | Per-app tones, app picker, browser profiles | `vowen-activewin` (KDE; X11 via xprop; not on GNOME Wayland) | implemented |
-| Pause media while dictating | `playback-controller`: MPRIS + `wpctl` | implemented |
-| Screenshots (region, click capture, meetings) | `vowen-screenshot`: spectacle, grim, gnome-screenshot or `import` | implemented |
-| Command-mode file actions | file manager selection via Ctrl+C and `text/uri-list` | implemented |
-| Open with / `vowen://` links | desktop file + argv on first launch | implemented |
-| Stop recording on lock / suspend | ScreenSaver D-Bus signal, logind | implemented |
-| Autostart, start minimized to tray | XDG autostart | implemented |
+| Pause media while dictating | `playback-controller`: MPRIS + `wpctl` | helper tested with an MPRIS player; Pro feature, not tested in the app |
+| Screenshots (region, click capture, meetings) | `vowen-screenshot`: spectacle, grim, gnome-screenshot or `import` | tested (capture API, KDE) |
+| Command-mode file actions | file manager selection via Ctrl+C and `text/uri-list` | helper tested |
+| Open with / `vowen://` links, file transcription | desktop file + argv | tested |
+| Stop recording on lock / suspend | ScreenSaver D-Bus signal, logind | tested (simulated lock signal) |
+| Autostart, start minimized to tray | XDG autostart | tested |
 | Cloud models (OpenAI, Deepgram, ...) and AI features | unchanged from Vowen | should work, not tested |
 | Custom shortcuts not leaking into apps | keyboard grab + re-emit, opt-in `VOWEN_SWALLOW=1` | experimental |
 | Notch indicator, Share extension, Apple Notes/Reminders connectors | macOS only | not available |
@@ -71,7 +73,7 @@ means built and unit-tested but not yet driven through the app.
 
 Start Vowen from the menu or with `vowen-linux`. The launcher is deliberately not called `vowen`: Vowen's Developer settings look for its own `vowen` command-line tool on `PATH`. It also picks the key store (`--password-store`: KWallet on KDE, libsecret on GNOME and others) and adds your login shell's `PATH`, so CLI agents such as Claude Code or Codex in `~/.local/bin` or npm-global are found.
 
-Terminals paste with Ctrl+Shift+V: set `VOWEN_PASTE_CHORD=ctrl+shift+v` if you mostly dictate into a terminal.
+Terminals are detected on KDE and X11 and get Ctrl+Shift+V. Elsewhere, set `VOWEN_PASTE_CHORD=ctrl+shift+v` if you mostly dictate into a terminal.
 
 ## Known limitations
 
@@ -80,6 +82,8 @@ Terminals paste with Ctrl+Shift+V: set `VOWEN_PASTE_CHORD=ctrl+shift+v` if you m
 - Clipboard managers (Klipper) record dictated text.
 - Mouse position is only exact on KDE (KWin); other Wayland compositors fall back to XWayland's view.
 - Vowen updates need a new release of this kit, because the patches are matched against a specific Vowen version.
+- GTX 10xx (Pascal): the released CUDA add-on is built with CUDA 12.9 and includes these cards. A CUDA 13 build from source does not; build with Vulkan there. With several GPUs, pick one with `CUDA_VISIBLE_DEVICES` or `GGML_VK_VISIBLE_DEVICES`.
+- Pro features (diarization in notes, meeting detection, media pause, chat with notes) behave as on macOS: they need a Vowen Pro license.
 
 ## Layout
 
