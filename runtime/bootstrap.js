@@ -34,4 +34,19 @@ app.setLoginItemSettings = ({ openAtLogin }) => {
   ].join('\n'));
 };
 
+// KWin + XWayland: Chromium keeps a stale origin (off by the decoration height) for windows
+// that were placed while hidden, so clicks land offset until the user moves the window.
+// A 1px move right after showing makes it re-read its real position.
+app.on('browser-window-created', (_e, win) => {
+  // The app menu exists for macOS; on Linux keep it reachable via Alt only.
+  win.setAutoHideMenuBar(true);
+  win.setMenuBarVisibility(false);
+  win.on('show', () => setTimeout(() => {
+    if (win.isDestroyed()) return;
+    const [x, y] = win.getPosition();
+    win.setPosition(x, y + 1);
+    win.setPosition(x, y);
+  }, 100));
+});
+
 require('../dist-electron/main.bundle.js');
