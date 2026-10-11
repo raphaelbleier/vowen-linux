@@ -1,0 +1,17 @@
+[package]
+name = "parakeet-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Parakeet ONNX transcription for Vowen (Linux)"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+transcribe-rs = { version = "=0.3.11", features = ["onnx"] }
+# libonnxruntime.so (1.24.2) is located at runtime via ORT_DYLIB_PATH
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["load-dynamic"] }
+
+[profile.release]
+opt-level = 3
+strip = true

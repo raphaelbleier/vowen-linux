@@ -1,0 +1,18 @@
+[package]
+name = "diarize-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Offline speaker diarization for Vowen (Linux)"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hound = "3.5"
+serde_json = "1"
+sherpa-onnx = "=1.13.4"
+# the wrapper accepts sys ^1.13.4 but only compiles against exactly 1.13.4
+sherpa-onnx-sys = "=1.13.4"
+
+[profile.release]
+opt-level = 3
+strip = true
