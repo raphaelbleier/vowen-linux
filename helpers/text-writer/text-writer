@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Linux text-writer for Vowen (clipboard paste helper).
+  text-writer [--delay MS] [--char-delay MS] [--method clipboard|direct] [--no-restore] [--allow-history]
+              [--html HTML] [--snapshot PATH | --restore PATH | --set-clipboard] [--] [TEXT]
+Clipboard: wl-copy/wl-paste when WAYLAND_DISPLAY is set, else xclip, else xsel.
+Paste chord: vowen-input socket -> ydotool -> xdotool. Chord is Ctrl+V; set VOWEN_PASTE_CHORD=ctrl+shift+v (or
+shift+insert) for terminals. 'direct' is the same as 'clipboard' (layout/Unicode-safe); --html, --char-delay and
+--allow-history are accepted and ignored (wl-copy/xclip offer one MIME type and cannot set transient hints)."""
+import argparse, json, os, shutil, socket, struct, subprocess, sys, time
+
+TEXT_MIMES = ["text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"]
+SNAP_MIMES = TEXT_MIMES + ["text/html", "image/png", "image/jpeg"]  # restore prefers this order, one flavor only
+MAGIC = b"VWNCLIP1"
+KEYS = {"ctrl": 29, "shift": 42, "alt": 56, "meta": 125, "v": 47, "c": 46, "insert": 110}
+
+
+def die(msg, code=1):
+    print(f"Error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def run(cmd, data=None):
+    return subprocess.run(cmd, input=data, capture_output=True, timeout=5)
+
+
+class Clip:
+    def __init__(self):
+        if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+            self.kind = "wl"
+        elif shutil.which("xclip"):
+            self.kind = "xclip"
+        elif shutil.which("xsel"):
+            self.kind = "xsel"
+        else:
+            die("no clipboard tool (install wl-clipboard or xclip)")
+
+    def types(self):
+        if self.kind == "wl":
+            r = run(["wl-paste", "-l"])
+            return r.stdout.decode(errors="replace").split("\n") if r.returncode == 0 else []
+        if self.kind == "xclip":
+            r = run(["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"])
+            return r.stdout.decode(errors="replace").split("\n") if r.returncode == 0 else []
+        return ["text/plain"] if self.get("text/plain") else []
+
+    def get(self, mime):
+        if self.kind == "wl":
+            r = run(["wl-paste", "-n", "-t", mime])
+        elif self.kind == "xclip":
+            r = run(["xclip", "-selection", "clipboard", "-t", mime, "-o"])
+        else:
+            r = run(["xsel", "-b", "-o"])
+        return r.stdout if r.returncode == 0 else b""
+
+    def set(self, data, mime="text/plain;charset=utf-8"):
+        if self.kind == "wl":  # wl-copy forks into the background to own the selection
+            cmd = ["wl-copy", "-t", mime]
+        elif self.kind == "xclip":
+            cmd = ["xclip", "-selection", "clipboard", "-t", mime.split(";")[0], "-i"]
+        else:
+            cmd = ["xsel", "-b", "-i"]
+        # background owner keeps pipes open, so don't capture them
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        p.stdin.write(data)
+        p.stdin.close()
+        if self.kind != "wl":
+            time.sleep(0.02)  # xclip/xsel stay alive as owner; wl-copy parent exits quickly
+        else:
+            p.wait(timeout=5)
+
+    def clear(self):
+        if self.kind == "wl":
+            run(["wl-copy", "--clear"])
+        else:
+            self.set(b"")
+
+    def snapshot(self):
+        have = set(self.types())
+        out = MAGIC
+        for m in SNAP_MIMES:
+            if m in have:
+                d = self.get(m)
+                if d:
+                    n = m.encode()
+                    out += struct.pack("<I", len(n)) + n + struct.pack("<Q", len(d)) + d
+        return out
+
+    def restore(self, blob):
+        if not blob.startswith(MAGIC):
+            die("not a clipboard snapshot")
+        flavors, i = {}, len(MAGIC)
+        while i < len(blob):
+            (nl,) = struct.unpack_from("<I", blob, i)
+            name = blob[i + 4:i + 4 + nl].decode()
+            (dl,) = struct.unpack_from("<Q", blob, i + 4 + nl)
+            start = i + 12 + nl
+            if start + dl > len(blob):
+                die("snapshot truncated")
+            flavors[name] = blob[start:start + dl]
+            i = start + dl
+        for m in SNAP_MIMES:  # wl-copy/xclip offer a single MIME: best flavor wins
+            if m in flavors:
+                return self.set(flavors[m], m)
+        self.clear()
+
+
+def send_chord(chord):
+    names = chord.lower().split("+")
+    try:
+        codes = [KEYS[n] for n in names]
+    except KeyError:
+        die(f"unknown key in VOWEN_PASTE_CHORD={chord!r}")
+    sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "vowen-input.sock")
+    try:
+        with socket.socket(socket.AF_UNIX) as s:
+            s.settimeout(2)
+            s.connect(sock)
+            s.sendall(json.dumps({"cmd": "chord", "keys": codes}).encode() + b"\n")
+            if json.loads(s.makefile().readline()).get("ok"):
+                return
+    except (OSError, ValueError):
+        pass
+    attempts = []
+    if shutil.which("ydotool"):
+        attempts.append(["ydotool", "key", *[f"{c}:1" for c in codes], *[f"{c}:0" for c in reversed(codes)]])
+    if shutil.which("xdotool") and os.environ.get("DISPLAY"):
+        attempts.append(["xdotool", "key", chord.lower()])
+    for cmd in attempts:
+        if run(cmd).returncode == 0:
+            return
+    die("no input backend could send the paste chord (vowen-input socket, ydotool, xdotool)", 2)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--delay", type=int, default=0)
+    ap.add_argument("--char-delay", type=int, default=0)
+    ap.add_argument("--method", choices=["clipboard", "direct"], default="clipboard")
+    ap.add_argument("--no-restore", action="store_true")
+    ap.add_argument("--allow-history", action="store_true")
+    ap.add_argument("--html")
+    ap.add_argument("--snapshot")
+    ap.add_argument("--restore")
+    ap.add_argument("--set-clipboard", action="store_true")
+    ap.add_argument("text", nargs="?")
+    a = ap.parse_args()
+    clip = Clip()
+
+    if a.snapshot:
+        with open(a.snapshot, "wb") as f:
+            f.write(clip.snapshot())
+        return
+    if a.restore:
+        with open(a.restore, "rb") as f:
+            clip.restore(f.read())
+        os.unlink(a.restore)
+        return
+    if not a.text:
+        die("Text cannot be empty")
+    data = a.text.encode()
+    if a.set_clipboard:
+        return clip.set(data)
+
+    if a.delay:
+        time.sleep(a.delay / 1000)
+    saved = None if a.no_restore else clip.snapshot()
+    clip.set(data)
+    for _ in range(10):  # verify the selection is ours before pasting
+        if clip.get("text/plain;charset=utf-8" if clip.kind == "wl" else "text/plain") == data:
+            break
+        time.sleep(0.01)
+    else:
+        die("Failed to verify clipboard content was set")
+    time.sleep(0.02)
+    try:
+        send_chord(os.environ.get("VOWEN_PASTE_CHORD", "ctrl+v"))
+        if saved is not None:
+            time.sleep(0.3)  # target app reads the clipboard asynchronously after the chord
+    finally:
+        if saved is not None:
+            clip.restore(saved)
+
+
+if __name__ == "__main__":
+    main()

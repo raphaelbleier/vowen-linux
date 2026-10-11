@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""vowen-input: evdev -> uiohook event stream + uinput key injection (stdlib only).
+
+stdout : NDJSON events in uiohook-napi shape (type 4/5 key, 6/7/8 mouse), see translate().
+stdin  : {"cmd":"key","key":<uiohook code>,"toggle":0 tap|1 down|2 up}; EOF = parent died -> exit.
+socket : $XDG_RUNTIME_DIR/vowen-input.sock, evdev-code commands (chord/tap/ping), see notes/CONTEXT.md.
+exit 13: no input device readable and no uinput (missing permissions).
+"""
+import errno, fcntl, json, os, selectors, signal, socket, struct, sys, time
+
+EV_SYN, EV_KEY = 0, 1
+KEY_MAX = 0x2ff
+OWN_NAME = b"vowen-input virtual keyboard"
+EVENT = struct.Struct("llHHi")  # struct input_event on 64-bit linux
+SOCK_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "vowen-input.sock")
+
+# evdev -> uiohook. Codes 1..0x58 are identical; only the differing ones are listed.
+EXTENDED = {
+    96: 0x0E1C, 97: 0x0E1D, 98: 0x0E35, 99: 0x0E37, 100: 0x0E38,
+    102: 0x0E47, 103: 0xE048, 104: 0x0E49, 105: 0xE04B, 106: 0xE04D,
+    107: 0x0E4F, 108: 0xE050, 109: 0x0E51, 110: 0x0E52, 111: 0x0E53,
+    125: 0x0E5B, 126: 0x0E5C,
+    183: 0x5B, 184: 0x5C, 185: 0x5D,                 # F13-F15
+    **{186 + i: 0x63 + i for i in range(9)},         # F16-F24
+}
+TO_UIOHOOK = {**{c: c for c in range(1, 0x59)}, **EXTENDED}
+TO_EVDEV = {v: k for k, v in TO_UIOHOOK.items()}
+BUTTONS = {0x110: 1, 0x111: 2, 0x112: 3, 0x113: 4, 0x114: 5}  # BTN_LEFT..BTN_EXTRA
+MODS = {42: "shiftKey", 54: "shiftKey", 29: "ctrlKey", 97: "ctrlKey",
+        56: "altKey", 100: "altKey", 125: "metaKey", 126: "metaKey"}
+
+
+def parse_events(buf):
+    """bytes -> [(type, code, value, ms)]; trailing partial struct is ignored."""
+    n = len(buf) // EVENT.size
+    return [(t, c, v, s * 1000 + us // 1000)
+            for s, us, t, c, v in (EVENT.unpack_from(buf, i * EVENT.size) for i in range(n))]
+
+
+class Translator:
+    """Stateful evdev -> uiohook event conversion (modifier flags, click on release)."""
+
+    def __init__(self):
+        self.held = set()
+
+    def translate(self, etype, code, value, ms):
+        if etype != EV_KEY or value == 2:  # drop autorepeat
+            return []
+        down = value == 1
+        if code in BUTTONS:
+            # x/y: evdev only has relative motion, app never reads them -> 0
+            base = {"time": ms, "x": 0, "y": 0, "button": BUTTONS[code], "clicks": 1, **self.flags()}
+            return [{"type": 7, **base}] if down else [{"type": 8, **base}, {"type": 6, **base}]
+        if code not in TO_UIOHOOK:
+            return []
+        (self.held.add if down else self.held.discard)(code)
+        return [{"type": 4 if down else 5, "time": ms, **self.flags(), "keycode": TO_UIOHOOK[code]}]
+
+    def flags(self):
+        f = {"altKey": False, "ctrlKey": False, "metaKey": False, "shiftKey": False}
+        for c in self.held:
+            if c in MODS:
+                f[MODS[c]] = True
+        return f
+
+
+# ---- ioctl helpers -------------------------------------------------------
+def _ioc(d, t, nr, size):
+    return (d << 30) | (size << 16) | (ord(t) << 8) | nr
+
+
+def eviocgbit(ev, n): return _ioc(2, "E", 0x20 + ev, n)
+def eviocgname(n): return _ioc(2, "E", 6, n)
+UI_SET_EVBIT, UI_SET_KEYBIT = _ioc(1, "U", 100, 4), _ioc(1, "U", 101, 4)
+UI_DEV_SETUP, UI_DEV_CREATE = _ioc(1, "U", 3, 92), _ioc(0, "U", 1, 0)
+
+
+def classify(fd):
+    """'kbd' / 'mouse' / None (also None for our own virtual device)."""
+    name = fcntl.ioctl(fd, eviocgname(256), bytes(256)).split(b"\0")[0]
+    if name == OWN_NAME:
+        return None
+    bits = fcntl.ioctl(fd, eviocgbit(EV_KEY, KEY_MAX // 8 + 1), bytes(KEY_MAX // 8 + 1))
+    has = lambda k: bits[k // 8] >> (k % 8) & 1
+    return "kbd" if has(30) else "mouse" if has(0x110) else None  # KEY_A / BTN_LEFT
+
+
+class Injector:
+    """uinput virtual keyboard; created lazily again if it failed earlier."""
+
+    def __init__(self):
+        self.fd = None
+
+    def ensure(self):
+        if self.fd is not None:
+            return
+        fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        try:
+            fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+            for k in range(1, 249):
+                fcntl.ioctl(fd, UI_SET_KEYBIT, k)
+            fcntl.ioctl(fd, UI_DEV_SETUP, struct.pack("HHHH80sI", 0x03, 0x1209, 0x0001, 1, OWN_NAME, 0))
+            fcntl.ioctl(fd, UI_DEV_CREATE)
+        except OSError:
+            os.close(fd)
+            raise
+        time.sleep(0.2)  # let the compositor pick the device up
+        self.fd = fd
+
+    def key(self, code, down):
+        self.ensure()
+        os.write(self.fd, EVENT.pack(0, 0, EV_KEY, code, int(down)) + EVENT.pack(0, 0, EV_SYN, 0, 0))
+
+    def handle(self, msg, pause=0.004):
+        """Run one command with evdev codes; returns reply dict."""
+        try:
+            cmd = msg.get("cmd")
+            if cmd == "ping":
+                return {"ok": True}
+            if cmd == "chord":
+                keys = [int(k) for k in msg["keys"]]
+            elif cmd == "tap":
+                keys = [int(msg["key"])]
+            elif cmd == "key":  # from the shim: uiohook code + toggle
+                code = TO_EVDEV[int(msg["key"])]
+                t = msg.get("toggle", 0)
+                if t == 0:
+                    keys = [code]
+                else:
+                    self.key(code, t == 1)
+                    return {"ok": True}
+            else:
+                return {"ok": False, "error": "unknown cmd"}
+            for k in keys:
+                self.key(k, True)
+                time.sleep(pause)
+            for k in reversed(keys):
+                self.key(k, False)
+                time.sleep(pause)
+            return {"ok": True}
+        except (OSError, KeyError, TypeError, ValueError) as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def main():
+    sel = selectors.DefaultSelector()
+    tr, inj = Translator(), Injector()
+    devs, rejected = {}, set()  # path -> fd ; paths not worth reopening
+    denied = False
+
+    def scan():
+        nonlocal denied
+        try:
+            names = {"/dev/input/" + n for n in os.listdir("/dev/input") if n.startswith("event")}
+        except OSError:
+            return
+        rejected.intersection_update(names)
+        for path in names - set(devs) - rejected:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                kind = classify(fd)
+            except OSError as e:
+                rejected.add(path)
+                denied |= e.errno in (errno.EACCES, errno.EPERM)
+                continue
+            if kind:
+                devs[path] = fd
+                sel.register(fd, selectors.EVENT_READ, ("dev", path))
+            else:
+                os.close(fd)
+                rejected.add(path)
+
+    def drop(path):
+        fd = devs.pop(path)
+        sel.unregister(fd)
+        os.close(fd)
+
+    def emit(ev):
+        sys.stdout.write(json.dumps(ev, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+
+    scan()
+    try:
+        inj.ensure()
+    except OSError as e:
+        print(f"vowen-input: uinput unavailable ({e}); key injection disabled", file=sys.stderr)
+    if not devs and denied and inj.fd is None:
+        print("vowen-input: permission denied on /dev/input and /dev/uinput (add user to group 'input')", file=sys.stderr)
+        sys.exit(13)
+    if not devs:
+        print("vowen-input: no readable input devices; hotkeys disabled (will keep rescanning)", file=sys.stderr)
+
+    try:
+        os.unlink(SOCK_PATH)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(SOCK_PATH)
+        os.chmod(SOCK_PATH, 0o600)
+        srv.listen(8)
+        srv.setblocking(False)
+        sel.register(srv, selectors.EVENT_READ, ("srv", None))
+    except OSError as e:
+        print(f"vowen-input: socket {SOCK_PATH} unavailable ({e}); text-writer falls back to ydotool/xdotool", file=sys.stderr)
+    os.set_blocking(0, False)
+    sel.register(0, selectors.EVENT_READ, ("stdin", None))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    bufs = {}  # socket/stdin buffers
+    bufs[0] = b""
+    last_scan = time.monotonic()
+
+    def lines(key, data):
+        bufs[key] = bufs.get(key, b"") + data
+        *done, bufs[key] = bufs[key].split(b"\n")
+        for ln in done:
+            try:
+                yield json.loads(ln)
+            except ValueError:
+                yield {}
+
+    try:
+        while True:
+            for k, _ in sel.select(timeout=1):
+                kind, path = k.data
+                if kind == "dev":
+                    try:
+                        data = os.read(k.fd, EVENT.size * 64)
+                    except BlockingIOError:
+                        continue
+                    except OSError:  # ENODEV: unplugged
+                        drop(path)
+                        continue
+                    for e in parse_events(data):
+                        for ev in tr.translate(*e):
+                            emit(ev)
+                elif kind == "srv":
+                    c, _a = srv.accept()
+                    c.settimeout(0.5)
+                    sel.register(c, selectors.EVENT_READ, ("cli", None))
+                elif kind == "cli":
+                    c = k.fileobj
+                    try:
+                        data = c.recv(4096)
+                    except OSError:
+                        data = b""
+                    if not data:
+                        sel.unregister(c); c.close(); bufs.pop(c, None)
+                        continue
+                    for msg in lines(c, data):
+                        try:
+                            c.sendall(json.dumps(inj.handle(msg)).encode() + b"\n")
+                        except OSError:
+                            pass
+                else:  # stdin
+                    try:
+                        data = os.read(0, 4096)
+                    except BlockingIOError:
+                        continue
+                    if not data:
+                        return  # parent died / closed us
+                    for msg in lines(0, data):
+                        inj.handle(msg)
+            if time.monotonic() - last_scan > 2:
+                last_scan = time.monotonic()
+                scan()
+                if inj.fd is None:
+                    try:
+                        inj.ensure()
+                    except OSError:
+                        pass
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    main()

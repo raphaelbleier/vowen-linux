@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Linux audio-recorder for Vowen: NDJSON commands on stdin, framed [u8 type][u32le len][payload] on stdout.
+type 1 = JSON event, type 2 = s16le mono PCM. Capture via parec (PipeWire/PulseAudio). Logs go to stderr."""
+import json, os, select, struct, subprocess, sys, threading, time
+
+OUT_LOCK = threading.Lock()
+MIC_RATE, LOOP_RATE = 16000, 48000
+CHUNK = 1600          # bytes per mic frame = 800 samples = 50 ms @16k
+STALL_MS = 2000       # no data for this long -> mic-stall
+LOOP_SILENT_S = 10
+
+
+def log(*a):
+    print("[audio-recorder]", *a, file=sys.stderr, flush=True)
+
+
+def frame(kind, payload):
+    with OUT_LOCK:
+        sys.stdout.buffer.write(struct.pack("<BI", kind, len(payload)) + payload)
+        sys.stdout.buffer.flush()
+
+
+def event(**kw):
+    frame(1, json.dumps(kw).encode())
+
+
+def pactl(*args):
+    return subprocess.run(["pactl", *args], capture_output=True, text=True, timeout=5).stdout
+
+
+def mic_sources():
+    """[(description, name)] of real (non-monitor) sources, default source first."""
+    try:
+        srcs = json.loads(pactl("--format=json", "list", "sources"))
+        default = pactl("get-default-source").strip()
+    except Exception as e:
+        log("list sources failed:", e)
+        return []
+    out = [(s.get("properties", {}).get("device.description") or s.get("description") or s["name"], s["name"])
+           for s in srcs if not s["name"].endswith(".monitor")]
+    out.sort(key=lambda d: d[1] != default)  # stable: default first
+    return out
+
+
+def resolve_chain(names):
+    """Ranked device names -> list of source names, ending with None (system default)."""
+    srcs, chain = mic_sources(), []
+    for n in names:
+        for desc, name in srcs:
+            if n in (desc, name) and name not in chain:
+                chain.append(name)
+                break
+        else:
+            log(f"device {n!r} unavailable")
+    return chain + [None]
+
+
+class Capture(threading.Thread):
+    def __init__(self, chain, rate, latency, chunk, loopback=False):
+        super().__init__(daemon=True)
+        self.chain, self.rate, self.latency, self.chunk, self.loopback = chain, rate, latency, chunk, loopback
+        self.stop_evt = threading.Event()
+        self.proc = None
+
+    def spawn(self, dev):
+        cmd = ["parec", f"--rate={self.rate}", "--channels=1", "--format=s16le", f"--latency-msec={self.latency}"]
+        if dev:
+            cmd.append(f"--device={dev}")
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def run(self):
+        buf, idx, stalled, unrec, zero_since, stall_t0 = b"", 0, False, False, None, 0
+        last, fails = time.monotonic(), 0
+        silent_sent = False
+        try:
+            self.proc = self.spawn(self.chain[idx])
+        except OSError as e:
+            return self.fail(str(e))
+        while not self.stop_evt.is_set():
+            r, _, _ = select.select([self.proc.stdout], [], [], 0.1)
+            data = os.read(self.proc.stdout.fileno(), 65536) if r else None
+            if data:
+                last, fails = time.monotonic(), 0
+                if stalled:
+                    stalled = unrec = False
+                    event(type="mic-stall-recovered")
+                buf += data
+                while len(buf) >= self.chunk:
+                    pcm, buf = buf[:self.chunk], buf[self.chunk:]
+                    frame(2, pcm)
+                    if self.loopback and not silent_sent:
+                        if any(pcm):
+                            zero_since = None
+                        else:
+                            zero_since = zero_since or time.monotonic()
+                            if time.monotonic() - zero_since > LOOP_SILENT_S:
+                                silent_sent = True
+                                event(type="loopback-silent", message="no audio on system output")
+                continue
+            gap = (time.monotonic() - last) * 1000
+            if data == b"" or self.proc.poll() is not None or gap > STALL_MS:
+                if self.loopback:
+                    return self.fail("parec exited" if self.proc.poll() is not None else "no data")
+                if not stalled:
+                    stalled, stall_t0 = True, last
+                    event(type="mic-stall", gapMs=int(gap))
+                elif time.monotonic() - stall_t0 > 10 and not unrec:
+                    unrec = True
+                    event(type="mic-stall-unrecovered")
+                self.kill()
+                fails += 1
+                if fails % 3 == 0:  # fall through the ranked chain, wrap to default last
+                    idx = (idx + 1) % len(self.chain)
+                time.sleep(0.2)
+                try:
+                    self.proc = self.spawn(self.chain[idx])
+                except OSError as e:
+                    log("respawn failed:", e)
+                last = time.monotonic()
+        # stop: kill, drain what parec already wrote, flush
+        self.kill()
+        try:
+            while True:
+                d = os.read(self.proc.stdout.fileno(), 65536)
+                if not d:
+                    break
+                buf += d
+        except OSError:
+            pass
+        while buf:
+            frame(2, buf[:self.chunk])
+            buf = buf[self.chunk:]
+
+    def kill(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+
+    def fail(self, msg):
+        if self.loopback:
+            event(type="loopback-error", message=msg)
+            self.kill()
+            os._exit(1)
+
+    def stop(self):
+        self.stop_evt.set()
+        self.join(1.0)  # never block stop for long
+        self.kill()
+
+
+def main():
+    mic = loop = None
+    for line in sys.stdin:
+        try:
+            cmd = json.loads(line)
+        except ValueError:
+            continue
+        c = cmd.get("command")
+        log("cmd", c)
+        try:
+            if c == "list-devices":
+                event(type="device-list", devices=[d for d, _ in mic_sources()])
+            elif c == "get-device-config":
+                event(type="audio-config", input_sample_rate=48000, output_sample_rate=MIC_RATE, channels=1)
+            elif c == "start":
+                if mic:
+                    mic.stop()
+                names = [n for n in [cmd.get("device_name"), *(cmd.get("device_names") or [])] if n]
+                event(type="capture-connecting")
+                mic = Capture(resolve_chain(names), MIC_RATE, 20, CHUNK)
+                mic.start()
+            elif c == "stop":
+                if mic:
+                    mic.stop()
+                    mic = None
+                event(type="drain-complete")
+            elif c == "start-loopback":
+                if loop:
+                    loop.stop()
+                try:
+                    sink = pactl("get-default-sink").strip()
+                    assert sink
+                except Exception:
+                    event(type="loopback-error", message="no default audio sink")
+                    sys.exit(1)
+                event(type="audio-config", output_sample_rate=LOOP_RATE, channels=1)
+                loop = Capture([sink + ".monitor"], LOOP_RATE, 40, LOOP_RATE * 2 // 25, loopback=True)  # 40 ms frames
+                loop.start()
+            elif c == "stop-loopback":
+                if loop:
+                    loop.stop()
+                    loop = None
+        except SystemExit:
+            raise
+        except Exception as e:
+            log("error handling", c, e)
+    for cap in (mic, loop):
+        if cap:
+            cap.stop()
+
+
+if __name__ == "__main__":
+    main()

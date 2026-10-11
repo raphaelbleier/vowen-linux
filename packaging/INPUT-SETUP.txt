@@ -1,0 +1,8 @@
+vowen-input (global hotkeys + key injection) needs /dev/input/event* (read) and /dev/uinput (write).
+One-time setup:
+  sudo cp 60-vowen-input.rules /etc/udev/rules.d/
+  sudo udevadm control --reload && sudo udevadm trigger
+  sudo usermod -aG input $USER     # then log out and in
+  (check: ls -l /dev/uinput; id | grep input)
+Security note: members of "input" can read every keystroke; that is what a global hotkey hook is.
+Without permission the app still runs; hotkeys and paste injection are disabled (warning is logged once).

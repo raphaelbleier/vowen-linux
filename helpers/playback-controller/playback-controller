@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Linux playback-controller for Vowen: pause MPRIS players / mute the default sink while dictating.
+
+Protocol (same as the mac/win helper):
+  playback-controller test     -> one JSON line {"ok":true,"functional":bool}
+  playback-controller daemon   -> one JSON request per stdin line, exactly one JSON reply line each:
+    {"cmd":"pause"}                -> {"ok":true,"paused":true,"sessions":[...]} | {"ok":true,"paused":false,"reason":...}
+    {"cmd":"resume","sessions":[]} -> {"ok":true,"resumed":bool}
+    {"cmd":"mute"} / {"cmd":"unmute"} -> {"ok":true,"muted"|"unmuted":bool}
+"""
+import json
+import shutil
+import subprocess
+import sys
+
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
+
+
+def busctl(*args):
+    out = subprocess.run(["busctl", "--user", "--json=short", *args],
+                         capture_output=True, text=True, timeout=3)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip() or "busctl failed")
+    return json.loads(out.stdout) if out.stdout.strip() else None
+
+
+def players():
+    names = busctl("call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                   "org.freedesktop.DBus", "ListNames")["data"][0]
+    return [n for n in names if n.startswith("org.mpris.MediaPlayer2.")]
+
+
+def status(name):
+    try:
+        return busctl("get-property", name, MPRIS_PATH, PLAYER_IFACE, "PlaybackStatus")["data"]
+    except Exception:
+        return None
+
+
+def player_call(name, method):
+    busctl("call", name, MPRIS_PATH, PLAYER_IFACE, method)
+
+
+def pause():
+    found = players()
+    if not found:
+        return {"ok": True, "paused": False, "reason": "no-media-session"}
+    playing = [n for n in found if status(n) == "Playing"]
+    if not playing:
+        return {"ok": True, "paused": False, "reason": "not-playing"}
+    for n in playing:
+        player_call(n, "Pause")
+    return {"ok": True, "paused": True, "sessions": playing}
+
+
+def resume(sessions):
+    resumed = False
+    for n in sessions or []:
+        try:
+            player_call(n, "Play")
+            resumed = True
+        except Exception:
+            pass
+    return {"ok": True, "resumed": resumed}
+
+
+we_muted = False
+
+
+def sink_muted():
+    out = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                         capture_output=True, text=True, timeout=3).stdout
+    return "[MUTED]" in out
+
+
+def set_mute(on):
+    subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1" if on else "0"],
+                   check=True, timeout=3)
+
+
+def mute():
+    global we_muted
+    if sink_muted():
+        return {"ok": True, "muted": False}
+    set_mute(True)
+    we_muted = True
+    return {"ok": True, "muted": True}
+
+
+def unmute():
+    global we_muted
+    if not we_muted:
+        return {"ok": True, "unmuted": False}
+    set_mute(False)
+    we_muted = False
+    return {"ok": True, "unmuted": True}
+
+
+def handle(req):
+    cmd = req.get("cmd")
+    if cmd == "pause":
+        return pause()
+    if cmd == "resume":
+        return resume(req.get("sessions"))
+    if cmd == "mute":
+        return mute()
+    if cmd == "unmute":
+        return unmute()
+    return {"ok": False, "error": f"unknown command: {cmd}"}
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "test":
+        ok = bool(shutil.which("busctl")) and bool(shutil.which("wpctl"))
+        print(json.dumps({"ok": True, "functional": ok}), flush=True)
+        return
+    if mode != "daemon":
+        print("usage: playback-controller test|daemon", file=sys.stderr)
+        sys.exit(2)
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            reply = handle(json.loads(line))
+        except Exception as e:
+            reply = {"ok": False, "error": str(e)}
+        print(json.dumps(reply), flush=True)
+
+
+if __name__ == "__main__":
+    main()

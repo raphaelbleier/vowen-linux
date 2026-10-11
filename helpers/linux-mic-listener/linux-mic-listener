@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""Mic-in-use detector speaking the windows-mic-listener protocol: 'MIC_START <pid>' / 'MIC_STOP <pid>' lines.
+Usage: linux-mic-listener [--exclude-pid N]. Ignores N and its descendants (our own capture), monitors, corked
+streams and known desktop-noise clients."""
+import json, os, select, subprocess, sys
+
+NOISE_BINS = {"plasmashell", "pavucontrol", "pipewire", "wireplumber", "kwin_wayland", "krfb", "kdeconnectd",
+              "pw-cli", "pw-dump", "pw-top", "pactl"}
+NOISE_MEDIA = {"Peak detect"}
+
+
+def pactl_json(what):
+    return json.loads(subprocess.run(["pactl", "--format=json", "list", what], capture_output=True, text=True,
+                                     timeout=5).stdout)
+
+
+def descends_from(pid, root):
+    for _ in range(32):
+        if pid == root:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if pid <= 1:
+            return False
+    return False
+
+
+def recording_pids(exclude):
+    monitors = {s["index"] for s in pactl_json("sources") if s["name"].endswith(".monitor")}
+    pids = set()
+    for so in pactl_json("source-outputs"):
+        p = so.get("properties", {})
+        pid = p.get("application.process.id")
+        if (so.get("corked") or not pid or not pid.isdigit() or so.get("source") in monitors
+                or p.get("application.process.binary") in NOISE_BINS or p.get("media.name") in NOISE_MEDIA):
+            continue
+        if exclude and descends_from(int(pid), exclude):
+            continue
+        pids.add(int(pid))
+    return pids
+
+
+def main():
+    exclude = int(sys.argv[sys.argv.index("--exclude-pid") + 1]) if "--exclude-pid" in sys.argv else 0
+    sub = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True, bufsize=1)
+    known = set()
+
+    def refresh():
+        nonlocal known
+        try:
+            now = recording_pids(exclude)
+        except Exception as e:
+            print("refresh failed:", e, file=sys.stderr)
+            return
+        for p in sorted(now - known):
+            print(f"MIC_START {p}", flush=True)
+        for p in sorted(known - now):
+            print(f"MIC_STOP {p}", flush=True)
+        known = now
+
+    refresh()
+    dirty = False
+    while True:
+        r, _, _ = select.select([sub.stdout], [], [], 0.15 if dirty else None)
+        if r:
+            line = sub.stdout.readline()
+            if not line:
+                return 1  # server gone; Vowen restarts us
+            dirty = dirty or "source-output" in line
+        elif dirty:
+            dirty = False
+            refresh()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        pass

@@ -1,0 +1,8 @@
+# Allows Chromium's user-namespace sandbox for Vowen (same as Ubuntu's profiles for other Electron apps).
+abi <abi/4.0>,
+include <tunables/global>
+
+profile vowen-linux @DIR@/vowen flags=(unconfined) {
+  userns,
+  include if exists <local/vowen-linux>
+}

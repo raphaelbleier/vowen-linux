@@ -1,0 +1,3 @@
+# Lets members of group "input" create a uinput device (key injection for vowen-input).
+# Reading /dev/input/event* already requires group "input" on standard distros; no rule needed for that.
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"

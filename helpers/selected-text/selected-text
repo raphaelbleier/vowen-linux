@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Prints the PRIMARY selection (any bundle-id/pid argument is ignored); exit 1 if empty.
+ponytail: PRIMARY can be stale after deselecting; drop this helper to use Vowen's exact Ctrl+C fallback instead."""
+import os, shutil, subprocess, sys
+
+if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+    cmd = ["wl-paste", "-p", "-n", "-t", "text/plain"]
+elif shutil.which("xclip"):
+    cmd = ["xclip", "-o", "-selection", "primary"]
+elif shutil.which("xsel"):
+    cmd = ["xsel", "-p", "-o"]
+else:
+    sys.exit(2)
+try:
+    out = subprocess.run(cmd, capture_output=True, timeout=1.5).stdout.decode(errors="replace")
+except subprocess.TimeoutExpired:
+    sys.exit(1)
+if not out.strip():
+    sys.exit(1)
+sys.stdout.write(out)
