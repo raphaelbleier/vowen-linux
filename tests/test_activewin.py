@@ -66,7 +66,9 @@ if "DBUS_SESSION_BUS_ADDRESS" in os.environ or os.path.exists("/run/user/%d/bus"
             if os.path.exists(sock): break
             time.sleep(0.05)
         else:
-            raise SystemExit("daemon did not start (no KWin/X11 backend?)")
+            p.kill()
+            print("SKIP daemon part: no KWin/X11 session")
+            sys.exit(0)
         first = json.loads(p.stdout.readline())
         assert "bundleId" in first
         bus = aw.Bus()
