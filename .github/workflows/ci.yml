@@ -10,6 +10,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: shellcheck -x -S warning install.sh scripts/*.sh engines/*.sh packaging/*.sh
+      - name: README badge shows the pinned Vowen version
+        run: . ./versions.env && grep -q "badge/Vowen-$VOWEN_VERSION-" README.md
   tests:
     runs-on: ubuntu-24.04
     steps:
@@ -18,8 +20,8 @@ jobs:
         with: { node-version: 22 }
       - name: python helper tests (device-bound ones skip themselves)
         run: for t in tests/test_*.py; do echo "== $t"; python3 "$t"; done
-      - name: node shim test
-        run: node tests/test_shim.js
+      - name: node tests (shim, patch matcher)
+        run: node tests/test_shim.js && node tests/test_apply.mjs
   patches:
     runs-on: ubuntu-24.04
     timeout-minutes: 45

@@ -1,4 +1,17 @@
-# vowen-linux
+<p align="center"><img src="docs/logo.svg" width="112" alt="vowen-linux logo"></p>
+
+<h1 align="center">vowen-linux</h1>
+
+<p align="center">
+  <a href="https://github.com/raphaelbleier/vowen-linux/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/raphaelbleier/vowen-linux/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/raphaelbleier/vowen-linux/actions/workflows/engines.yml"><img alt="engines build" src="https://github.com/raphaelbleier/vowen-linux/actions/workflows/engines.yml/badge.svg"></a>
+  <a href="https://github.com/raphaelbleier/vowen-linux/actions/workflows/upstream.yml"><img alt="Vowen update check" src="https://github.com/raphaelbleier/vowen-linux/actions/workflows/upstream.yml/badge.svg"></a>
+  <br>
+  <img alt="Vowen version" src="https://img.shields.io/badge/Vowen-0.5.10-f2862b">
+  <img alt="latest Vowen" src="https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fassets.vowen.ai%2Flatest-mac.yml&query=%24.version&label=latest%20Vowen&color=555">
+  <a href="https://github.com/raphaelbleier/vowen-linux/releases"><img alt="engines release" src="https://img.shields.io/github/v/release/raphaelbleier/vowen-linux?filter=engines-*&label=engines&color=f2862b"></a>
+  <img alt="last commit" src="https://img.shields.io/github/last-commit/raphaelbleier/vowen-linux?label=last%20change">
+</p>
 
 Unofficial Linux build kit for [Vowen](https://vowen.ai), the voice dictation and meeting-notes app for macOS and Windows.
 
@@ -85,11 +98,26 @@ Terminals are detected on KDE and X11 and get Ctrl+Shift+V. Elsewhere, set `VOWE
 - GTX 10xx (Pascal): the released CUDA add-on is built with CUDA 12.9 and includes these cards. A CUDA 13 build from source does not; build with Vulkan there. With several GPUs, pick one with `CUDA_VISIBLE_DEVICES` or `GGML_VK_VISIBLE_DEVICES`.
 - Pro features (diarization in notes, meeting detection, media pause, chat with notes) behave as on macOS: they need a Vowen Pro license.
 
+## Updating to a new Vowen release
+
+The `upstream` workflow checks Vowen's update feed every day. When a new version is out, it downloads it on the runner,
+runs every patch against it and opens an issue listing the patches that no longer match, with the line where each one's
+code moved and the `versions.env` lines to bump. Local equivalent:
+
+```sh
+scripts/check-upstream.sh            # newest release from the feed
+scripts/check-upstream.sh "" 0.5.9   # a specific release
+```
+
+Patches tolerate the obfuscator renaming local variables and shifted indentation (see `patches/apply.mjs`), so
+usually only patches whose surrounding code really changed need work. After the patches apply, test the app end to
+end: a new Vowen version can change behaviour no patch covers.
+
 ## Layout
 
 ```
 install.sh            download, verify, deobfuscate, patch, assemble, install
-patches/              Linux patches, applied to the deobfuscated bundle (each must match exactly)
+patches/              Linux patches, applied to the deobfuscated bundle (each must match exactly once)
 runtime/bootstrap.js  Linux entry point (autostart support), then loads Vowen
 helpers/              Linux replacements for Vowen's native helpers (Python, stdlib only)
 shims/                drop-in replacement for uiohook-napi backed by vowen-input
@@ -101,6 +129,8 @@ tests/                helper protocol tests
 ## Third-party licenses
 
 See [NOTICE](NOTICE) for the engines, npm packages and speech models (Parakeet is CC-BY-4.0, Nemotron EN is under the NVIDIA Open Model License).
+
+The logo is this project's own and not Vowen's.
 
 ## License
 
