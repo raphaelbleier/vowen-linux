@@ -80,7 +80,7 @@ means built and unit-tested but not yet driven through the app.
 | Stop recording on lock / suspend | ScreenSaver D-Bus signal, logind | tested (simulated lock signal) |
 | Autostart, start minimized to tray | XDG autostart | tested |
 | Cloud models (OpenAI, Deepgram, ...) and AI features | unchanged from Vowen | should work, not tested |
-| Claude Haiku 5.5 for AI features | added to the Anthropic model list by this kit | listed, not tested (needs an API key) |
+| Claude Haiku 5.5 for AI features | added by this kit as the recommended Anthropic model (Haiku 4.5 still selectable) | listed, not tested (needs an API key) |
 | Custom shortcuts not leaking into apps | keyboard grab + re-emit, opt-in `VOWEN_SWALLOW=1` | experimental |
 | Notch indicator, Share extension, Apple Notes/Reminders connectors | macOS only | not available |
 | Automatic updates | Vowen's updater is disabled | re-run `install.sh` |
