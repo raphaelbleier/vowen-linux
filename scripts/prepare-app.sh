@@ -6,6 +6,9 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(dirname "$HERE")
 # shellcheck source=../versions.env
 . "$ROOT/versions.env"
+# check-upstream.sh points this at a newer Vowen release that versions.env does not pin yet
+# shellcheck disable=SC1090
+[ -z "${VOWEN_OVERRIDE:-}" ] || . "$VOWEN_OVERRIDE"
 # shellcheck source=common.sh
 . "$HERE/common.sh"
 WORK=${1:?usage: prepare-app.sh <workDir> <cacheDir>}
@@ -30,4 +33,4 @@ for f in "$APP"/dist-electron/*.js "$APP"/dist-react/*.js; do
 done
 
 say "Applying Linux patches"
-node "$ROOT/patches/apply.mjs" "$APP" | grep -v '^ok' || true
+node "$ROOT/patches/apply.mjs" "$APP" >/dev/null || die "Linux patches do not match Vowen $VOWEN_VERSION (see FAIL lines above)"
