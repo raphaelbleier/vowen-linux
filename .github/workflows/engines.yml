@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to publish to (e.g. engines-v1). Empty = build only, keep as workflow artifacts.
+        description: Release to upload to (e.g. engines-v2). Create it first (gh release create TAG); GITHUB_TOKEN may not create tags. Empty = build only.
         required: false
   push:
     tags: ['engines-v*']
