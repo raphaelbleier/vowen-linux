@@ -48,8 +48,8 @@ export default [
   {
     id: 'start-minimized-to-tray-setting',
     file: SETTINGS,
-    find: `const eR = process.platform === "win32";`,
-    replace: `const eR = process.platform === "win32" || process.platform === "linux";`,
+    find: `const eR = process.platform === "win32";\n  const eS = eJ.modelSize || "";`,
+    replace: `const eR = process.platform === "win32" || process.platform === "linux";\n  const eS = eJ.modelSize || "";`,
   },
   {
     id: 'playback-controller-linux',

@@ -111,26 +111,23 @@ export default [
     `nemotronVariant: "multilingual",\n          platforms: ["darwin", "linux"],\n          onnx: ${MULTI},`),
 
   // --- storage / install detection / download / delete for Nemotron
-  swap('maconly-nemotron-getModelPath', `const C1 = k.coreml && k.coreml.filename || k.filename;`,
-    `const C1 = process.platform === "linux" && k.onnx ? k.onnx.filename : k.coreml && k.coreml.filename || k.filename;`),
+  // model path and delete: same shape, two sites
+  swap('maconly-nemotron-filename', `if (k.engine === "nemotron") {\n            const C1 = k.coreml && k.coreml.filename || k.filename;`,
+    `if (k.engine === "nemotron") {\n            const C1 = process.platform === "linux" && k.onnx ? k.onnx.filename : k.coreml && k.coreml.filename || k.filename;`, 2),
   swap('maconly-nemotron-installed',
     `if (M.existsSync(D.join(C3, "metadata.json")) && M.existsSync(D.join(C3, "tokenizer.json"))) {`,
     `if (M.existsSync(D.join(C3, "metadata.json")) && M.existsSync(D.join(C3, "tokenizer.json")) || process.platform === "linux" && M.existsSync(D.join(C3, "tokens.txt"))) {`),
   swap('maconly-nemotron-download',
     `return await this._downloadNemotronModel(T, X, k);`,
     `return process.platform === "linux" && X.onnx ? await this._downloadParakeetOnnxModel(T, X, k) : await this._downloadNemotronModel(T, X, k);`),
-  swap('maconly-nemotron-delete',
-    `const g = k.coreml && k.coreml.filename || k.filename;\n            const S = D.join(q.getPath("userData"), "models", g);`,
-    `const g = process.platform === "linux" && k.onnx ? k.onnx.filename : k.coreml && k.coreml.filename || k.filename;\n            const S = D.join(q.getPath("userData"), "models", g);`),
 
   // --- multi-file HuggingFace downloader (entries with onnx.files)
   swap('maconly-download-files', `async _downloadParakeetOnnxModel(T, k, X) {`, DOWNLOAD_FILES),
 
   // --- sherpa-asr-cli binary path
-  swap('maconly-binary-packaged', `diarizeCli: M.join(V, "bin", "diarize-cli" + E),`,
-    `diarizeCli: M.join(V, "bin", "diarize-cli" + E),\n              sherpaAsrCli: M.join(V, "bin", "sherpa-asr-cli" + E),`),
-  swap('maconly-binary-dev', `diarizeCli: M.join(m, "bin", "diarize-cli" + E),`,
-    `diarizeCli: M.join(m, "bin", "diarize-cli" + E),\n              sherpaAsrCli: M.join(m, "bin", "sherpa-asr-cli" + E),`),
+  // packaged and dev paths: same shape, two sites
+  swap('maconly-binary-path', `diarizeCli: M.join(V, "bin", "diarize-cli" + E),`,
+    `diarizeCli: M.join(V, "bin", "diarize-cli" + E),\n              sherpaAsrCli: M.join(V, "bin", "sherpa-asr-cli" + E),`, 2),
 
   // --- transcription: Nemotron goes through the one-shot path with sherpa-asr-cli
   swap('maconly-nemotron-route',

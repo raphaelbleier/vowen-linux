@@ -60,8 +60,14 @@ export default [
     find: `await Y("open", ["-R", N]);`,
     replace: `await (process.platform === "linux" ? ${U}.reveal(N) : Y("open", ["-R", N]));` },
   { id: "voice-open-folder-xdg", file: MAIN,
-    find: `let am = ab[aH];`,
-    replace: `if (process.platform === "linux") Object.assign(ab, ${U}.xdgDirs());
+    find: `app: "/Applications"
+                })
+              };
+              let am = ab[aH];`,
+    replace: `app: "/Applications"
+                })
+              };
+              if (process.platform === "linux") Object.assign(ab, ${U}.xdgDirs());
               let am = ab[aH];` },
 
   // --- G-MEET: process names (comm + ".exe", see audio.patch) ---
