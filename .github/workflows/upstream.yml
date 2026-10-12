@@ -1,0 +1,41 @@
+name: upstream
+# Daily: is there a newer Vowen than versions.env pins, and do the Linux patches still apply to it?
+# A new release opens (or refreshes) an issue with the failing patches and the versions.env lines to bump.
+# The run fails while patches are broken, so the README badge shows it.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Vowen version to test instead of the update feed's latest (e.g. 0.5.9)
+        required: false
+permissions:
+  contents: read
+  issues: write
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: 7z
+        run: command -v 7z || sudo apt-get install -y p7zip-full
+      # Downloads the DMG from vowen.ai into a runner-local dir; it is never uploaded or cached as an artifact.
+      - id: check
+        run: scripts/check-upstream.sh "$RUNNER_TEMP/vowen-cache" "${{ inputs.version }}"
+      - name: Open or refresh the tracking issue
+        if: steps.check.outputs.status != 'current' && inputs.version == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.check.outputs.version }}
+        run: |
+          title="Vowen $VERSION released"
+          n=$(gh issue list --state open --search "\"$title\" in:title" --json number -q '.[0].number')
+          if [ -n "$n" ]; then gh issue edit "$n" --body-file upstream-report.md
+          else gh issue create --title "$title" --body-file upstream-report.md; fi
+      - name: Fail while patches do not apply
+        if: steps.check.outputs.status == 'broken'
+        run: exit 1
