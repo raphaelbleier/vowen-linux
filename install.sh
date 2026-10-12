@@ -103,6 +103,7 @@ fi
 
 say "Installing to $PREFIX"
 rm -rf "${PREFIX:?}.new"
+mkdir -p "$(dirname "$PREFIX")"
 mv "$DEST" "$PREFIX.new"
 rm -rf "${PREFIX:?}"
 mv "$PREFIX.new" "$PREFIX"
